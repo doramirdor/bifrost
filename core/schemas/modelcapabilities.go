@@ -1,12 +1,12 @@
 package schemas
 
-// BifrostOverrides carries per-(model, provider) manipulation hints sourced
-// from the bifrost datasheet (https://getbifrost.ai/datasheet). They capture
-// behaviour the runtime previously hard-coded (beta headers, server-tool
-// versioning, cache_point gating, reasoning/thinking shape, parameter-drop
-// rules, request-path routing).
+// ModelCapabilities is the per-(model, provider) capability record sourced from
+// the bifrost datasheet (https://getbifrost.ai/datasheet). It is the single
+// source of truth for behaviour the runtime previously hard-coded — model limits
+// (max_output_tokens), beta headers, server-tool versioning, cache_point gating,
+// reasoning/thinking shape, parameter-drop rules, request-path routing.
 //
-// All fields are optional; nil means "no override, use the runtime default
+// All fields are optional; nil means "not specified, use the runtime default
 // or the existing hardcoded helper". The (model, provider) pair is encoded
 // in the datasheet key prefix per existing convention:
 //
@@ -19,7 +19,7 @@ package schemas
 //
 // New fields should mirror the TypeScript definition in
 // bifrost-website/src/types/bifrostOverrides.ts.
-type BifrostOverrides struct {
+type ModelCapabilities struct {
 	// ---- Capability flags (mirrors TS supports_*) ----
 
 	SupportsCachePoint             *bool `json:"supports_cache_point,omitempty"`
@@ -37,7 +37,11 @@ type BifrostOverrides struct {
 	SupportsCompaction             *bool `json:"supports_compaction,omitempty"`
 	SupportsContextEditing         *bool `json:"supports_context_editing,omitempty"`
 	SupportsContext1M              *bool `json:"supports_context_1m,omitempty"`
-	SupportsFastMode               *bool `json:"supports_fast_mode,omitempty"`
+	SupportsFastMode               *bool `json:"supports_speed,omitempty"` // datasheet emits fast mode as supports_speed
+	SupportsAdaptiveThinking       *bool `json:"supports_adaptive_thinking,omitempty"`
+	SupportsNativeEffort           *bool `json:"supports_native_effort,omitempty"`
+	SupportsMidConversationSystem  *bool `json:"supports_mid_conversation_system_messages,omitempty"`
+	SupportsSamplingParams         *bool `json:"supports_sampling_params,omitempty"` // false ⇒ temperature/top_p/top_k rejected (adaptive-only models)
 	SupportsRedactThinking         *bool `json:"supports_redact_thinking,omitempty"`
 	SupportsTaskBudgets            *bool `json:"supports_task_budgets,omitempty"`
 	SupportsEagerInputStreaming    *bool `json:"supports_eager_input_streaming,omitempty"`
@@ -104,6 +108,10 @@ type BifrostOverrides struct {
 
 	// ---- Singletons ----
 
+	// Model's max output-token ceiling from the datasheet params feed. Providers
+	// requiring an explicit max_tokens (e.g. Anthropic) default to this.
+	MaxOutputTokens *int `json:"max_output_tokens,omitempty"`
+
 	// Default max_tokens when the caller omits it (Anthropic requires a value).
 	DefaultMaxTokens *int `json:"default_max_tokens,omitempty"`
 
@@ -145,12 +153,12 @@ type BifrostOverrides struct {
 	// UnsupportedFields["top_p"] and ConditionallyUnsupportedFields["top_p"].
 	// The wire JSON still carries `accepts_top_p` for legacy clients;
 	// Go's json decoder ignores unknown fields so this is safe.
-	AcceptsTopK            *bool `json:"accepts_top_k,omitempty"`
-	AcceptsTemperature     *bool `json:"accepts_temperature,omitempty"`
+	AcceptsTopK             *bool `json:"accepts_top_k,omitempty"`
+	AcceptsTemperature      *bool `json:"accepts_temperature,omitempty"`
 	AcceptsFrequencyPenalty *bool `json:"accepts_frequency_penalty,omitempty"`
-	AcceptsPresencePenalty *bool `json:"accepts_presence_penalty,omitempty"`
-	AcceptsStop            *bool `json:"accepts_stop,omitempty"`
-	AcceptsReasoningEffort *bool `json:"accepts_reasoning_effort,omitempty"`
+	AcceptsPresencePenalty  *bool `json:"accepts_presence_penalty,omitempty"`
+	AcceptsStop             *bool `json:"accepts_stop,omitempty"`
+	AcceptsReasoningEffort  *bool `json:"accepts_reasoning_effort,omitempty"`
 
 	// ---- Provider-rule fields duplicated per model (kept alongside UnsupportedFields) ----
 

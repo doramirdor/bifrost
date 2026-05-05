@@ -176,6 +176,8 @@ func (s *Store) applyModelParameters(paramsData map[string]json.RawMessage) int 
 	modelParamsEntries := make(map[string]providerUtils.ModelParams, len(paramsData))
 	newResponseTypes := make(map[string][]string, len(paramsData))
 	newParamsIndex := make(map[string][]string, len(paramsData))
+	overrides := make(map[string]*schemas.ModelCapabilities)
+	overrideCanonical := make(map[string]bool) // key → record came from the canonical row (model == base_model)
 	applied := 0
 
 	for model, rawData := range paramsData {
@@ -231,6 +233,49 @@ func (s *Store) applyModelParameters(paramsData map[string]json.RawMessage) int 
 				IsVertexMultiRegionOnly: parsed.VertexMultiRegionOnly,
 			}
 		}
+
+		// Model capabilities (behaviour overrides plus the max_output_tokens ceiling
+		// and vertex flag) live in the same blob. Collect them into a resident table
+		// keyed by the (base model, provider) composite so providers resolve them via
+		// CapabilitiesFor. Multiple raw rows can map to one (base, provider): the
+		// canonical row (model == base_model) wins; when no canonical row exists, the
+		// smaller max_output_tokens wins so we never default above a provider's real
+		// ceiling.
+		var ov schemas.ModelCapabilities
+		if err := json.Unmarshal(rawData, &ov); err == nil {
+			// Feed emits the vertex flag as vertex_multi_region_only; the struct tag
+			// differs (is_vertex_multi_region_only), so copy it across explicitly.
+			if parsed.VertexMultiRegionOnly != nil {
+				ov.IsVertexMultiRegionOnly = parsed.VertexMultiRegionOnly
+			}
+			if !isEmptyModelCapabilities(&ov) {
+				provider := gjson.GetBytes(rawData, "provider").String()
+				base := gjson.GetBytes(rawData, "base_model").String()
+				if base == "" {
+					base = extractModelName(model)
+				}
+				if provider != "" {
+					key := providerUtils.CapabilityCacheKey(base, schemas.ModelProvider(normalizeProvider(provider)))
+					canonical := model == base
+					switch existing := overrides[key]; {
+					case existing == nil:
+						ovCopy := ov
+						overrides[key] = &ovCopy
+						overrideCanonical[key] = canonical
+					case canonical && !overrideCanonical[key]:
+						ovCopy := ov
+						if ovCopy.MaxOutputTokens == nil {
+							ovCopy.MaxOutputTokens = existing.MaxOutputTokens
+						}
+						overrides[key] = &ovCopy
+						overrideCanonical[key] = true
+					case !overrideCanonical[key] && ov.MaxOutputTokens != nil &&
+						(existing.MaxOutputTokens == nil || *ov.MaxOutputTokens < *existing.MaxOutputTokens):
+						existing.MaxOutputTokens = ov.MaxOutputTokens
+					}
+				}
+			}
+		}
 	}
 
 	s.mu.Lock()
@@ -240,6 +285,15 @@ func (s *Store) applyModelParameters(paramsData map[string]json.RawMessage) int 
 
 	if len(modelParamsEntries) > 0 {
 		providerUtils.BulkSetModelParams(modelParamsEntries)
+	}
+	// Wholesale-replace the resident override table (the feed always carries the
+	// full set, so this also drops entries whose overrides were removed). Skipped
+	// when nothing parsed — an empty or wholly-malformed feed must not wipe a
+	// good table, since every pod reloads from here on the gossip hook.
+	if applied > 0 {
+		providerUtils.ReplaceModelCapabilities(overrides)
+	} else if s.logger != nil {
+		s.logger.Warn("model-parameters-sync: no parseable records, keeping existing model capabilities")
 	}
 	return applied
 }

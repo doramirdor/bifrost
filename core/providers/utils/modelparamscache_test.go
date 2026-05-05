@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+
+	"github.com/maximhq/bifrost/core/schemas"
 )
 
 func intPtr(v int) *int { return &v }
@@ -158,12 +160,12 @@ func TestGetMaxOutputTokensOrDefault(t *testing.T) {
 	cache := getModelParamsCache()
 	cache.Set("test-or-default", ModelParams{MaxOutputTokens: intPtr(16384)})
 
-	val := GetMaxOutputTokensOrDefault("test-or-default", 4096)
+	val := GetMaxOutputTokensOrDefault(schemas.Anthropic, "test-or-default", 4096)
 	if val != 16384 {
 		t.Errorf("expected cached value 16384, got %d", val)
 	}
 
-	val = GetMaxOutputTokensOrDefault("missing-model-default", 4096)
+	val = GetMaxOutputTokensOrDefault(schemas.Anthropic, "missing-model-default", 4096)
 	if val != 4096 {
 		t.Errorf("expected default 4096 for missing non-claude model, got %d", val)
 	}

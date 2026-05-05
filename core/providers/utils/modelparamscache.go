@@ -15,13 +15,6 @@ const DefaultModelParamsCacheSize = 2048
 type ModelParams struct {
 	MaxOutputTokens         *int
 	IsVertexMultiRegionOnly *bool // true when model is only available on Vertex multi-region pool endpoints (rep.googleapis.com)
-
-	// BifrostOverrides carries per-(model, provider) manipulation hints
-	// sourced from the bifrost datasheet. Populated from the same fetch
-	// path that supplies MaxOutputTokens. nil when the datasheet has no
-	// bifrost-specific overrides for the model. Callers should fall back
-	// to the existing hardcoded helpers when this is nil.
-	BifrostOverrides *schemas.BifrostOverrides
 }
 
 type modelParamsCacheEntry struct {
@@ -236,10 +229,15 @@ func GetMaxOutputTokens(model string) (int, bool) {
 	return *params.MaxOutputTokens, true
 }
 
-// GetMaxOutputTokensOrDefault returns the cached max_output_tokens for a model,
-// or the provided default value on cache miss. For Claude models, falls back to
-// known static defaults before using the caller's default.
-func GetMaxOutputTokensOrDefault(model string, defaultValue int) int {
+// GetMaxOutputTokensOrDefault returns the (provider, model)'s max_output_tokens
+// from the resident capability table, or the provided default on miss. For Claude
+// models it falls back to known static defaults before the caller's default. A
+// legacy, non-provider-aware LRU lookup sits in between as a transitional fallback
+// (still fed + lazily loaded) and is only reached when the capability table misses.
+func GetMaxOutputTokensOrDefault(provider schemas.ModelProvider, model string, defaultValue int) int {
+	if caps := CapabilitiesFor(provider, model); caps != nil && caps.MaxOutputTokens != nil {
+		return *caps.MaxOutputTokens
+	}
 	if m, ok := GetMaxOutputTokens(model); ok {
 		return m
 	}
@@ -259,114 +257,113 @@ func GetMaxOutputTokensOrDefault(model string, defaultValue int) int {
 
 // IsVertexMultiRegionOnlyModel reports whether the given model is flagged in the
 // datasheet as only available on Google Vertex multi-region pool endpoints
-// (aiplatform.{region}.rep.googleapis.com). Returns false on cache miss or if
-// the flag is not set. Looks up using "vertex_ai/" prefix since model-parameters
-// are stored with provider-prefixed keys.
+// (aiplatform.{region}.rep.googleapis.com). Returns false when the flag is not
+// set. Reads the (model, Vertex) capability record, with a transitional fallback
+// to the legacy LRU (keyed by the "vertex_ai/" provider-prefixed raw model).
 func IsVertexMultiRegionOnlyModel(model string) bool {
-	params, ok := GetModelParams("vertex_ai/" + model)
-	if !ok || params.IsVertexMultiRegionOnly == nil {
-		return false
+	if caps := CapabilitiesFor(schemas.Vertex, model); caps != nil && caps.IsVertexMultiRegionOnly != nil {
+		return *caps.IsVertexMultiRegionOnly
 	}
-	return *params.IsVertexMultiRegionOnly
+	if params, ok := GetModelParams("vertex_ai/" + model); ok && params.IsVertexMultiRegionOnly != nil {
+		return *params.IsVertexMultiRegionOnly
+	}
+	return false
 }
 
-// GetBifrostOverrides returns the cached bifrost overrides for a model key,
-// or nil on cache miss / no overrides. Callers must pass the
-// provider-prefixed model key as it appears in the datasheet:
-//
-//   - "claude-opus-4-7"                       — Anthropic native
-//   - "anthropic.claude-opus-4-7-...-v1:0"    — Bedrock canonical
-//   - "us.anthropic.claude-...-v1:0"          — Bedrock regional alias
-//   - "azure/claude-opus-4-7"                 — Azure
-//   - "vertex_ai/claude-opus-4-7"             — Vertex Anthropic
-//   - "vertex_ai/gemini-2.5-pro"              — Vertex Gemini
-//
-// Returns nil so callers can fall back to existing hardcoded helpers when
-// the datasheet has no entry yet (e.g. brand-new model not in the seed).
-//
-// Most call sites should prefer GetBifrostOverridesForRequest, which
-// understands per-provider key conventions and tries the right keys
-// automatically.
-func GetBifrostOverrides(modelKey string) *schemas.BifrostOverrides {
-	params, ok := GetModelParams(modelKey)
-	if !ok || params.BifrostOverrides == nil {
-		return nil
+// modelCapabilitiesTable holds per-(model, provider) bifrost overrides sourced
+// from the datasheet model-parameters feed. Unlike the LRU model-params cache,
+// this is a fully-resident map: the override set is tiny (a handful of curated
+// models) yet read on the request hot path, so it must never be evicted. The
+// datasheet sync swaps the whole map under the write lock via
+// ReplaceModelCapabilities; reads take the shared lock. Keyed by CapabilityCacheKey
+// ("<model>|<provider>").
+var (
+	modelCapabilitiesMu    sync.RWMutex
+	modelCapabilitiesTable = map[string]*schemas.ModelCapabilities{}
+)
+
+// ReplaceModelCapabilities atomically swaps the entire overrides table. Called by
+// the datasheet sync after parsing the model-parameters feed, which always
+// carries the full set — so a wholesale replace also drops entries that no
+// longer have overrides.
+func ReplaceModelCapabilities(table map[string]*schemas.ModelCapabilities) {
+	if table == nil {
+		table = map[string]*schemas.ModelCapabilities{}
 	}
-	return params.BifrostOverrides
+	modelCapabilitiesMu.Lock()
+	modelCapabilitiesTable = table
+	modelCapabilitiesMu.Unlock()
 }
 
-// GetBifrostOverridesForRequest looks up bifrost overrides for a (provider,
-// model) pair, trying the conventional datasheet keys for that provider.
+// SetModelCapability additively inserts one override under the given cache key.
+// The sync path uses ReplaceModelCapabilities; this is for single-entry callers
+// and tests.
+func SetModelCapability(cacheKey string, ov *schemas.ModelCapabilities) {
+	modelCapabilitiesMu.Lock()
+	modelCapabilitiesTable[cacheKey] = ov
+	modelCapabilitiesMu.Unlock()
+}
+
+// DeleteModelCapability removes one override key (test cleanup).
+func DeleteModelCapability(cacheKey string) {
+	modelCapabilitiesMu.Lock()
+	delete(modelCapabilitiesTable, cacheKey)
+	modelCapabilitiesMu.Unlock()
+}
+
+// GetModelCapabilities returns the resident bifrost overrides stored under the
+// exact cache key, or nil on miss. Overrides live under the CapabilityCacheKey
+// composite ("<model>|<provider>"), so callers should almost always use
+// CapabilitiesFor, which builds that key from the runtime
+// (provider, model). This raw-key form is exported mainly for the sync path and
+// tests.
+func GetModelCapabilities(cacheKey string) *schemas.ModelCapabilities {
+	modelCapabilitiesMu.RLock()
+	ov := modelCapabilitiesTable[cacheKey]
+	modelCapabilitiesMu.RUnlock()
+	return ov
+}
+
+// CapabilityCacheKey builds the model-params cache key under which bifrost
+// overrides are stored: "<model>|<provider>". This mirrors the pricing store's
+// (model, provider) keying (datasheet makeKey), so a model's overrides stay
+// distinct per provider — e.g. supports_speed=true on Anthropic vs absent on
+// Vertex for the same claude-opus-4-8. The datasheet sync populates the cache
+// with this exact key; CapabilitiesFor reconstructs it at request
+// time from the runtime (provider, model).
+func CapabilityCacheKey(model string, provider schemas.ModelProvider) string {
+	return model + "|" + string(provider)
+}
+
+// CapabilitiesFor looks up bifrost overrides for a (provider,
+// model) pair, mirroring how pricing resolves a (model, provider) row: overrides
+// live under the CapabilityCacheKey composite, so provider is part of the key and
+// the same model never collides across providers.
 //
-// Lookup precedence (first hit wins):
-//
-//  1. The model string verbatim. Already-prefixed inputs like
-//     "anthropic.claude-opus-4-7-...-v1:0" or "us.anthropic.claude-..."
-//     match the datasheet key directly.
-//  2. Provider-conventional prefix, picked by family on Bedrock:
-//     - Bedrock + Claude    → "anthropic.<model>"
-//     - Bedrock + Llama     → "meta.<model>"
-//     - Bedrock + Mistral   → "mistral.<model>"
-//     - Bedrock + Nova/etc. → "amazon.<model>"
-//     - Vertex              → "vertex_ai/<model>" (Anthropic-on-Vertex
-//       uses bare keys which are already covered by (1))
-//     - Azure               → "azure/<model>"
+// Overrides are keyed by the datasheet's bare base_model (e.g. "claude-opus-4-7"),
+// but the runtime model can be a Bedrock dotted id ("us.anthropic.claude-...-v1:0"),
+// a Vertex "@version" id, or a dated variant. So after trying the exact model we
+// collapse it to its base via normalizeClaudeModelName — the same normalization
+// GetMaxOutputTokensOrDefault uses for Bedrock/Vertex — and try that. Plain
+// schemas.BaseModelName is not enough: it strips date/version suffixes but not
+// the provider/region prefix or ":"/"@" version markers.
 //
 // Returns nil on miss so callers can fall back to existing hardcoded helpers.
-func GetBifrostOverridesForRequest(provider schemas.ModelProvider, model string) *schemas.BifrostOverrides {
+func CapabilitiesFor(provider schemas.ModelProvider, model string) *schemas.ModelCapabilities {
 	if model == "" {
 		return nil
 	}
-
-	// (1) Verbatim. Bedrock and Vertex callers typically pass already-
-	// prefixed model strings ("anthropic.claude-...", "us.anthropic....",
-	// "claude-...@20251101"). Anthropic native passes the bare name which
-	// also matches the datasheet key.
-	if ov := GetBifrostOverrides(model); ov != nil {
+	if ov := GetModelCapabilities(CapabilityCacheKey(model, provider)); ov != nil {
 		return ov
 	}
-
-	// (2) Provider-conventional prefix. Useful when a caller passes a bare
-	// model name and the datasheet has it stored under a provider prefix.
-	for _, candidate := range candidateBifrostOverrideKeys(provider, model) {
-		if ov := GetBifrostOverrides(candidate); ov != nil {
-			return ov
+	// normalizeClaudeModelName is Claude-specific — it strips everything before
+	// the last ".", which mangles names like "gpt-4.1-2025-04-14" into "1".
+	if strings.Contains(model, "claude") {
+		if base := normalizeClaudeModelName(model); base != model {
+			if ov := GetModelCapabilities(CapabilityCacheKey(base, provider)); ov != nil {
+				return ov
+			}
 		}
-	}
-
-	return nil
-}
-
-// candidateBifrostOverrideKeys returns the provider-conventional datasheet
-// keys to try for a bare model name (after the verbatim lookup misses).
-// Order matters — the most likely match comes first. Used by
-// GetBifrostOverridesForRequest.
-func candidateBifrostOverrideKeys(provider schemas.ModelProvider, model string) []string {
-	switch provider {
-	case schemas.Vertex:
-		return []string{"vertex_ai/" + model}
-	case schemas.Azure:
-		return []string{"azure/" + model}
-	case schemas.Bedrock:
-		// Bedrock prefixes are family-stamped on the datasheet:
-		//   anthropic.<...>-v1:0   for Claude
-		//   meta.<...>-v1:0        for Llama
-		//   mistral.<...>-v1:0     for Mistral / Codestral
-		//   amazon.<...>           for Nova / Titan
-		//   ai21.<...>             for Jamba
-		//   cohere.<...>           for Command R / Embed
-		//   stability.<...>        for Stable Diffusion
-		switch {
-		case schemas.IsAnthropicModel(model):
-			return []string{"anthropic." + model}
-		case schemas.IsLlamaModel(model):
-			return []string{"meta." + model}
-		case schemas.IsMistralModel(model):
-			return []string{"mistral." + model}
-		case schemas.IsNovaModel(model):
-			return []string{"amazon." + model}
-		}
-		return nil
 	}
 	return nil
 }
@@ -384,6 +381,10 @@ func normalizeClaudeModelName(model string) string {
 	// Strip region + provider prefixes (us.anthropic., anthropic., etc.)
 	if idx := strings.LastIndex(model, "."); idx >= 0 {
 		model = model[idx+1:]
+	}
+	// Strip "@version" alias marker (Vertex/Bedrock, e.g. "...-4-5@20251001")
+	if idx := strings.Index(model, "@"); idx >= 0 {
+		model = model[:idx]
 	}
 	// Strip Bedrock version suffix (":0", ":1", etc.) and the preceding "-v1"/"-v2"
 	if idx := strings.Index(model, ":"); idx >= 0 {
