@@ -1879,11 +1879,11 @@ func rotateMCPOauthConfigFromFile(ctx context.Context, store configstore.ConfigS
 	if authorizedOauth.Scopes != "" {
 		_ = json.Unmarshal([]byte(authorizedOauth.Scopes), &fields.Scopes)
 	}
-	if fileBlock.ClientID != "" {
-		fields.ClientID = schemas.NewSecretVar(fileBlock.ClientID)
+	if fileBlock.ClientID.IsSet() {
+		fields.ClientID = fileBlock.ClientID
 	}
-	if fileBlock.ClientSecret != "" {
-		fields.ClientSecret = schemas.NewSecretVar(fileBlock.ClientSecret)
+	if fileBlock.ClientSecret.IsSet() {
+		fields.ClientSecret = fileBlock.ClientSecret
 	}
 	if fileBlock.AuthorizeURL != "" {
 		fields.AuthorizeURL = fileBlock.AuthorizeURL
@@ -6683,18 +6683,13 @@ func (c *Config) RedactMCPClientConfig(config *schemas.MCPClientConfig) *schemas
 	}
 
 	// Redact credentials inside the inline `oauth_config` bootstrap block.
-	// Its fields are plain strings, so route them through the SecretVar
-	// redaction to keep the wire format identical to the sibling
-	// oauth_client_id / oauth_client_secret fields. Copy the struct first —
-	// configCopy shares the pointer with the live config.
+	// Copy the struct first — configCopy shares the pointer with the live
+	// config, and Redacted() returns a fresh SecretVar so the live stash is
+	// never mutated.
 	if config.PendingOAuthConfig != nil {
 		pendingCopy := *config.PendingOAuthConfig
-		if pendingCopy.ClientID != "" {
-			pendingCopy.ClientID = (&schemas.SecretVar{Val: pendingCopy.ClientID}).Redacted().Val
-		}
-		if pendingCopy.ClientSecret != "" {
-			pendingCopy.ClientSecret = (&schemas.SecretVar{Val: pendingCopy.ClientSecret}).Redacted().Val
-		}
+		pendingCopy.ClientID = pendingCopy.ClientID.Redacted()
+		pendingCopy.ClientSecret = pendingCopy.ClientSecret.Redacted()
 		configCopy.PendingOAuthConfig = &pendingCopy
 	}
 
