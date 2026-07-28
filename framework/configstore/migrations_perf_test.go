@@ -300,3 +300,197 @@ func TestMigrationMergeOauthTokenTablesPerf(t *testing.T) {
 		})
 	}
 }
+
+// perfFlowRowCount is the row count for the create_mcp_oauth_flows_table
+// perf test below. Unlike the token-table merge above, there is only one
+// source table here (oauth_user_sessions) and no shared/per-user split to
+// mirror, so this is a single flat ~1,000,000-row seed.
+const perfFlowRowCount = 1_000_000
+
+// setupPreCreateFlowsSQLiteDB runs every configstore migration EXCEPT the
+// final two steps (create_mcp_oauth_flows_table and its follow-on
+// drop_oauth_config_pkce_columns), leaving oauth_user_sessions in its real
+// pre-migration shape (complete with the uniqueIndex on state that
+// TableOauthUserSession's struct tag has always carried) and mcp_oauth_flows
+// not yet created — the exact starting state migrationCreateMCPOauthFlowsTable
+// expects to run against on an existing deployment.
+func setupPreCreateFlowsSQLiteDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	n := time.Now().UnixNano() + testDBCounter
+	testDBCounter++
+	dsn := fmt.Sprintf("file:perftestdb_flows_%d?mode=memory&cache=shared", n)
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	require.NoError(t, err, "failed to open perf test sqlite db")
+
+	runPreCreateFlowsMigrationChain(t, db)
+	return db
+}
+
+// trySetupPreCreateFlowsPostgresDB is trySetupPreMergePostgresDB's
+// counterpart for the flows migration — same fallback-to-nil-on-unavailable
+// behavior, same dedicated pgPerfTestSchema (safe to reuse across both perf
+// tests in this file: each wipes and recreates the schema fresh before
+// seeding, and the two perf tests never run concurrently against it).
+func trySetupPreCreateFlowsPostgresDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	db, err := gorm.Open(postgres.Open(postgresDSN), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	if err != nil {
+		return nil
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		return nil
+	}
+	if err := sqlDB.Ping(); err != nil {
+		return nil
+	}
+
+	if err := db.Exec("DROP SCHEMA IF EXISTS " + pgPerfTestSchema + " CASCADE").Error; err != nil {
+		return nil
+	}
+	if err := db.Exec("CREATE SCHEMA " + pgPerfTestSchema).Error; err != nil {
+		return nil
+	}
+	if err := db.Exec("SET search_path TO " + pgPerfTestSchema).Error; err != nil {
+		return nil
+	}
+
+	runPreCreateFlowsMigrationChain(t, db)
+
+	t.Cleanup(func() {
+		db.Exec("DROP SCHEMA IF EXISTS " + pgPerfTestSchema + " CASCADE")
+	})
+
+	return db
+}
+
+// runPreCreateFlowsMigrationChain runs every configstoreMigrationSteps entry
+// except the last two (create_mcp_oauth_flows_table and
+// drop_oauth_config_pkce_columns) and asserts the resulting schema is
+// genuinely pre-flows-migration: oauth_user_sessions exists, mcp_oauth_flows
+// does not. drop_oauth_config_pkce_columns is excluded too even though it
+// isn't the migration under test: it runs after create_mcp_oauth_flows_table
+// and touches oauth_configs, not oauth_user_sessions, so leaving it out
+// changes nothing this test cares about and keeps the "last registered step"
+// assertion below meaningful.
+func runPreCreateFlowsMigrationChain(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	require.GreaterOrEqual(t, len(configstoreMigrationSteps), 2)
+	targetStep := configstoreMigrationSteps[len(configstoreMigrationSteps)-2]
+	require.Equal(t, []string{"create_mcp_oauth_flows_table"}, targetStep.IDs,
+		"expected create_mcp_oauth_flows_table to be the second-to-last registered migration step; "+
+			"update the slice bound below if the registry changed")
+	preFlowSteps := configstoreMigrationSteps[:len(configstoreMigrationSteps)-2]
+
+	ctx := context.Background()
+	require.NoError(t, runMigrationSteps(ctx, db, testMigrationLogger, preFlowSteps),
+		"failed to run the pre-flows-migration chain")
+
+	require.False(t, db.Migrator().HasTable(&tables.TableMCPOauthFlow{}),
+		"mcp_oauth_flows should not exist before migrationCreateMCPOauthFlowsTable runs")
+	require.True(t, db.Migrator().HasTable(&tables.TableOauthUserSession{}),
+		"oauth_user_sessions should exist in its pre-migration shape")
+}
+
+// bulkInsertOauthUserSessions seeds count rows into oauth_user_sessions (the
+// pre-migration flow table), all in 'user' flow_mode, cycling through
+// numClients distinct MCP clients — same batched-INSERT-in-one-transaction
+// approach as bulkInsertOauthTokens/bulkInsertOauthUserTokens above. Every
+// row gets a distinct State (the column's real uniqueIndex would otherwise
+// reject the batch) and a distinct UserID.
+func bulkInsertOauthUserSessions(t *testing.T, db *gorm.DB, count int, numClients int) {
+	t.Helper()
+	now := time.Now()
+	expiresAt := now.Add(15 * time.Minute)
+	batch := make([]tables.TableOauthUserSession, 0, perfSeedInsertBatchSize)
+	require.NoError(t, db.Transaction(func(tx *gorm.DB) error {
+		for i := 0; i < count; i++ {
+			userID := fmt.Sprintf("perf-flow-user-%d", i)
+			batch = append(batch, tables.TableOauthUserSession{
+				ID:               fmt.Sprintf("perf-flow-%d", i),
+				MCPClientID:      fmt.Sprintf("perf-mcp-client-%d", i%numClients),
+				OauthConfigID:    fmt.Sprintf("perf-oauth-config-%d", i%numClients),
+				State:            fmt.Sprintf("perf-flow-state-%d", i),
+				RedirectURI:      "https://example.com/callback",
+				CodeVerifier:     fmt.Sprintf("perf-flow-verifier-%d", i),
+				UserID:           &userID,
+				FlowMode:         "user",
+				Status:           "pending",
+				EncryptionStatus: tables.EncryptionStatusPlainText,
+				ExpiresAt:        expiresAt,
+				CreatedAt:        now,
+				UpdatedAt:        now,
+			})
+			if len(batch) == perfSeedInsertBatchSize {
+				if err := tx.Create(&batch).Error; err != nil {
+					return err
+				}
+				batch = batch[:0]
+			}
+		}
+		if len(batch) > 0 {
+			return tx.Create(&batch).Error
+		}
+		return nil
+	}))
+}
+
+// TestMigrationCreateMCPOauthFlowsTablePerf seeds ~1,000,000 rows into the
+// pre-migration oauth_user_sessions table and measures how long the real
+// migrationCreateMCPOauthFlowsTable takes to run against that data. Same
+// rationale as TestMigrationMergeOauthTokenTablesPerf above (see its doc
+// comment) — this is also a CREATE-new-table +
+// INSERT...SELECT-from-old-table migration that runs synchronously at boot
+// behind a Postgres advisory lock.
+//
+// Gated behind BIFROST_RUN_MIGRATION_PERF_TESTS=1 — never runs as part of a
+// normal `go test ./...` or CI invocation.
+func TestMigrationCreateMCPOauthFlowsTablePerf(t *testing.T) {
+	if os.Getenv(migrationPerfTestEnvVar) != "1" {
+		t.Skipf("set %s=1 to run this migration performance test (seeds ~1,000,000 rows; slow by design)", migrationPerfTestEnvVar)
+	}
+
+	dbs := []namedDB{{"sqlite", setupPreCreateFlowsSQLiteDB(t)}}
+	if pgDB := trySetupPreCreateFlowsPostgresDB(t); pgDB != nil {
+		dbs = append(dbs, namedDB{"postgres", pgDB})
+	} else {
+		t.Log("postgres unavailable for this run; measuring against sqlite only")
+	}
+
+	for _, ndb := range dbs {
+		ndb := ndb
+		t.Run(ndb.name, func(t *testing.T) {
+			db := ndb.db
+			ctx := context.Background()
+
+			seedStart := time.Now()
+			seedSyntheticMCPClients(t, db, perfSyntheticClientCount)
+			bulkInsertOauthUserSessions(t, db, perfFlowRowCount, perfSyntheticClientCount)
+			t.Logf("[%s] seeded %d oauth_user_sessions rows in %v",
+				ndb.name, perfFlowRowCount, time.Since(seedStart))
+
+			var sessionCount int64
+			require.NoError(t, db.Table("oauth_user_sessions").Count(&sessionCount).Error)
+			require.EqualValues(t, perfFlowRowCount, sessionCount)
+
+			// This is the real function, invoked exactly like the migration
+			// registry invokes it — not a reimplementation of its SQL.
+			migrateStart := time.Now()
+			err := migrationCreateMCPOauthFlowsTable(ctx, db, testMigrationLogger)
+			elapsed := time.Since(migrateStart)
+			require.NoError(t, err, "migrationCreateMCPOauthFlowsTable should succeed against the seeded dataset")
+
+			t.Logf("[%s] migrationCreateMCPOauthFlowsTable took %v against %d seeded rows",
+				ndb.name, elapsed, perfFlowRowCount)
+
+			var flowCount int64
+			require.NoError(t, db.Table("mcp_oauth_flows").Count(&flowCount).Error)
+			require.EqualValues(t, perfFlowRowCount, flowCount,
+				"every seeded row should have been copied into mcp_oauth_flows")
+		})
+	}
+}
