@@ -35,6 +35,7 @@ import {
 	useGetCoreConfigQuery,
 	useGetVirtualKeysQuery,
 	useInitiateMCPClientVerificationMutation,
+	useReauthorizeMCPClientMutation,
 	useUpdateMCPClientMutation,
 	useVerifyMCPClientHeadersMutation,
 } from "@/lib/store";
@@ -105,11 +106,20 @@ export default function MCPClientSheet({
 	const isPerUserAuth = mcpClient.config.auth_type === "per_user_oauth" || mcpClient.config.auth_type === "per_user_headers";
 	const [updateMCPClient, { isLoading: isUpdating }] = useUpdateMCPClientMutation();
 	const [initiateVerification, { isLoading: isInitiatingVerification }] = useInitiateMCPClientVerificationMutation();
+	const [reauthorizeMCPClient, { isLoading: isReauthorizing }] = useReauthorizeMCPClientMutation();
 	const [verifyMCPClientHeaders] = useVerifyMCPClientHeadersMutation();
 
 	// Drives the OAuth2Authorizer dialog for a config.json-bootstrapped OAuth
 	// client sitting in pending_verification.
 	const [bootstrapAuthorize, setBootstrapAuthorize] = useState<
+		| { authorizeUrl: string; oauthConfigId: string; mcpClientId: string }
+		| null
+	>(null);
+	// Drives the OAuth2Authorizer dialog for a shared (auth_type='oauth')
+	// client redoing consent via POST /reauthorize — independent of
+	// bootstrapAuthorize, which is for the one-time initial-verification
+	// trigger only.
+	const [reauthorizeFlow, setReauthorizeFlow] = useState<
 		| { authorizeUrl: string; oauthConfigId: string; mcpClientId: string }
 		| null
 	>(null);
@@ -145,6 +155,27 @@ export default function MCPClientSheet({
 			toast({ title: "Authorization failed", description: getErrorMessage(error), variant: "destructive" });
 		}
 	}, [initiateVerification, mcpClient.config.client_id, mcpClient.config.auth_type, toast]);
+
+	const handleReauthorize = useCallback(async () => {
+		try {
+			const response = await reauthorizeMCPClient(mcpClient.config.client_id).unwrap();
+			if (response.status === "pending_oauth" && response.authorize_url) {
+				setReauthorizeFlow({
+					authorizeUrl: response.authorize_url,
+					oauthConfigId: response.oauth_config_id,
+					mcpClientId: mcpClient.config.client_id,
+				});
+			} else {
+				toast({
+					title: "Reauthorization failed",
+					description: "Unexpected response from server. Please try again.",
+					variant: "destructive",
+				});
+			}
+		} catch (error) {
+			toast({ title: "Reauthorization failed", description: getErrorMessage(error), variant: "destructive" });
+		}
+	}, [reauthorizeMCPClient, mcpClient.config.client_id, toast]);
 
 	const [pendingNavDirection, setPendingNavDirection] = useState<"prev" | "next" | null>(null);
 
@@ -482,7 +513,7 @@ export default function MCPClientSheet({
 
 	return (
 		<>
-			<Sheet open onOpenChange={(open) => !open && !bootstrapAuthorize && !bootstrapHeadersOpen && onClose()}>
+			<Sheet open onOpenChange={(open) => !open && !bootstrapAuthorize && !bootstrapHeadersOpen && !reauthorizeFlow && onClose()}>
 				<SheetContent className="flex w-full flex-col overflow-x-hidden pt-4 sm:max-w-[60%]">
 					<SheetHeader className="w-full p-0 px-8 py-4" showCloseButton={false} headerClassName="mb-0 sticky -top-4 bg-card z-10">
 						<div className="flex w-full items-center justify-between">
@@ -520,6 +551,18 @@ export default function MCPClientSheet({
 													: "Verify"}
 										</Button>
 									)}
+									{mcpClient.state === "needs_reauth" && hasUpdateMCPClientAccess && (
+										<Button
+											type="button"
+											size="sm"
+											variant="default"
+											disabled={isReauthorizing}
+											onClick={handleReauthorize}
+											data-testid="mcp-reauthorize-btn"
+										>
+											{isReauthorizing ? "Starting…" : "Reauthorize"}
+										</Button>
+									)}
 								</SheetTitle>
 								<SheetDescription>
 									{mcpClient.state === "pending_verification"
@@ -527,7 +570,7 @@ export default function MCPClientSheet({
 											? "This client was declared in config.json. A one-time admin test login is needed to verify the OAuth setup and discover tools — each user will authenticate individually afterward."
 											: "This client was declared in config.json and needs a one-time OAuth authorization before it can be used."
 										: mcpClient.state === "needs_reauth"
-											? "This connection's credentials have expired and need to be re-authorized. Re-authorization from the dashboard isn't available yet: recreating this client is the current workaround."
+											? "This connection's credentials need to be re-authorized. Click Reauthorize to redo the OAuth consent flow."
 											: "MCP server configuration and available tools"}
 								</SheetDescription>
 							</div>
@@ -1533,6 +1576,23 @@ export default function MCPClientSheet({
 						oauthConfigId={bootstrapAuthorize.oauthConfigId}
 						mcpClientId={bootstrapAuthorize.mcpClientId}
 						isPerUserOauth={mcpClient.config.auth_type === "per_user_oauth"}
+					/>
+				)}
+				{reauthorizeFlow && (
+					<OAuth2Authorizer
+						open={!!reauthorizeFlow}
+						onClose={() => setReauthorizeFlow(null)}
+						onSuccess={() => {
+							toast({ title: "Success", description: "MCP client re-authorized successfully" });
+							setReauthorizeFlow(null);
+							onSubmitSuccess();
+						}}
+						onError={(error) => {
+							toast({ title: "Reauthorization failed", description: error, variant: "destructive" });
+						}}
+						authorizeUrl={reauthorizeFlow.authorizeUrl}
+						oauthConfigId={reauthorizeFlow.oauthConfigId}
+						mcpClientId={reauthorizeFlow.mcpClientId}
 					/>
 				)}
 				{bootstrapHeadersOpen && (
