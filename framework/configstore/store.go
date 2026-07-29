@@ -491,7 +491,7 @@ type ConfigStore interface {
 	GetOauthConfigByID(ctx context.Context, id string) (*tables.TableOauthConfig, error)
 	GetOauthConfigsByIDs(ctx context.Context, ids []string) (map[string]*tables.TableOauthConfig, error)
 	CreateOauthConfig(ctx context.Context, config *tables.TableOauthConfig) error
-	UpdateOauthConfig(ctx context.Context, config *tables.TableOauthConfig) error
+	UpdateOauthConfig(ctx context.Context, config *tables.TableOauthConfig, tx ...*gorm.DB) error
 
 	// OAuth token CRUD. TableMCPOauthToken now holds every holder of an MCP
 	// OAuth credential (auth_mode 'shared' | 'user' | 'vk' | 'session'), not
@@ -594,6 +594,22 @@ type ConfigStore interface {
 	// always comes from an internal lookup already, never an arbitrary
 	// caller-supplied ID.
 	MarkOauthUserTokenNeedsReauthByID(ctx context.Context, tokenID string) error
+	// MarkTokensNeedsReauthByConfigID flips status to 'needs_reauth' on every
+	// token row bound to an OAuth config in one bulk UPDATE, with no
+	// auth_mode filter — rotating an oauth_configs row's client_id/client_secret
+	// invalidates every existing holder's cached credential (shared, per-user,
+	// vk, session, admin alike), not just the shared one.
+	MarkTokensNeedsReauthByConfigID(ctx context.Context, oauthConfigID string, tx ...*gorm.DB) error
+	// RotateMCPOAuthConfig updates every field of an oauth_configs row in
+	// place when ANY of them differs from what's stored (client_id,
+	// client_secret, authorize_url, token_url, registration_url, resource,
+	// scopes), and — only when something actually changed — cascades every
+	// token bound to that config to needs_reauth in the same transaction,
+	// regardless of which auth_mode holds it. Shared by the
+	// update-MCP-client API handler and the config.json sync path so OAuth
+	// config changes behave identically from both entry points. Returns
+	// whether a rotation actually happened.
+	RotateMCPOAuthConfig(ctx context.Context, existingOauthConfig *tables.TableOauthConfig, fields MCPOAuthConfigFields) (bool, error)
 	// GetOauthUserTokenByID looks up a single per-user token row by primary
 	// key. Returns nil, nil when not found. Unlike GetOauthTokenByID above,
 	// this DOES filter to auth_mode IN ('user','vk','session'): the sessions

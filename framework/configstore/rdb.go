@@ -6254,8 +6254,14 @@ func (s *RDBConfigStore) CreateOauthToken(ctx context.Context, token *tables.Tab
 }
 
 // UpdateOauthConfig updates an existing OAuth config
-func (s *RDBConfigStore) UpdateOauthConfig(ctx context.Context, config *tables.TableOauthConfig) error {
-	result := s.DB().WithContext(ctx).Save(config)
+func (s *RDBConfigStore) UpdateOauthConfig(ctx context.Context, config *tables.TableOauthConfig, tx ...*gorm.DB) error {
+	var txDB *gorm.DB
+	if len(tx) > 0 {
+		txDB = tx[0]
+	} else {
+		txDB = s.DB()
+	}
+	result := txDB.WithContext(ctx).Save(config)
 	if result.Error != nil {
 		return fmt.Errorf("failed to update oauth config: %w", result.Error)
 	}
@@ -6675,6 +6681,156 @@ func (s *RDBConfigStore) MarkOauthUserTokenNeedsReauthByID(ctx context.Context, 
 		return fmt.Errorf("failed to mark oauth user token %s needs_reauth: %w", tokenID, result.Error)
 	}
 	return nil
+}
+
+// MarkTokensNeedsReauthByConfigID flips status to 'needs_reauth' on every
+// token row bound to an OAuth config, in a single bulk UPDATE — no auth_mode
+// filter, unlike MarkOauthUserTokenNeedsReauthByID's single-row counterpart.
+// Called when an admin rotates an oauth_configs row's client_id/client_secret:
+// every existing holder (shared, per-user, vk, session, admin) loses Bifrost's
+// cached credential equally, since rotation is typically security-driven and
+// must not leave any holder silently still trusted. Precedent for the
+// single-statement bulk UPDATE shape: reconcileVKDirectTokensDB.
+func (s *RDBConfigStore) MarkTokensNeedsReauthByConfigID(ctx context.Context, oauthConfigID string, tx ...*gorm.DB) error {
+	if oauthConfigID == "" {
+		return nil
+	}
+	var txDB *gorm.DB
+	if len(tx) > 0 {
+		txDB = tx[0]
+	} else {
+		txDB = s.DB()
+	}
+	result := txDB.WithContext(ctx).
+		Model(&tables.TableMCPOauthToken{}).
+		Where("oauth_config_id = ?", oauthConfigID).
+		Update("status", "needs_reauth")
+	if result.Error != nil {
+		return fmt.Errorf("failed to mark tokens needs_reauth for oauth config %s: %w", oauthConfigID, result.Error)
+	}
+	return nil
+}
+
+// MCPOAuthConfigFields is a fully-resolved set of oauth_configs row values —
+// callers (the update-MCP-client API handler and the config.json sync path)
+// each apply their own "field not provided means keep the stored value"
+// semantics BEFORE constructing this struct; RotateMCPOAuthConfig only
+// diffs the fully-resolved values against what's stored and, if anything at
+// all differs, applies all of them together and cascades needs_reauth.
+//
+// UseDiscovery is deliberately absent: TableOauthConfig.UseDiscovery is
+// already marked deprecated ("discovery now happens automatically when URLs
+// are missing") and nothing reads it, so there is no live behavior to wire
+// a rotation path for.
+type MCPOAuthConfigFields struct {
+	ClientID        *schemas.SecretVar
+	ClientSecret    *schemas.SecretVar
+	AuthorizeURL    string
+	TokenURL        string
+	RegistrationURL string // "" means no registration URL stored (maps to a nil *string on the row)
+	Resource        string
+	Scopes          []string
+}
+
+// DiffersFrom reports whether ANY field in fields differs from what's
+// currently stored on existingOauthConfig. Exported so callers that need to
+// know "would this actually rotate" before deciding something else (e.g. the
+// update-MCP-client API handler rejects rotating while disabling a client,
+// but must not reject a no-op resubmission paired with a disable) can check
+// without duplicating this comparison logic — RotateMCPOAuthConfig uses this
+// same method internally.
+func (fields MCPOAuthConfigFields) DiffersFrom(existingOauthConfig *tables.TableOauthConfig) bool {
+	if existingOauthConfig == nil {
+		return true
+	}
+
+	var existingScopes []string
+	if existingOauthConfig.Scopes != "" {
+		_ = json.Unmarshal([]byte(existingOauthConfig.Scopes), &existingScopes)
+	}
+	newScopesSorted := slices.Clone(fields.Scopes)
+	slices.Sort(newScopesSorted)
+	existingScopesSorted := slices.Clone(existingScopes)
+	slices.Sort(existingScopesSorted)
+
+	existingRegistrationURL := ""
+	if existingOauthConfig.RegistrationURL != nil {
+		existingRegistrationURL = *existingOauthConfig.RegistrationURL
+	}
+
+	return !fields.ClientID.Equals(existingOauthConfig.ClientID) ||
+		!fields.ClientSecret.Equals(existingOauthConfig.ClientSecret) ||
+		fields.AuthorizeURL != existingOauthConfig.AuthorizeURL ||
+		fields.TokenURL != existingOauthConfig.TokenURL ||
+		fields.RegistrationURL != existingRegistrationURL ||
+		fields.Resource != existingOauthConfig.Resource ||
+		!slices.Equal(newScopesSorted, existingScopesSorted)
+}
+
+// RotateMCPOAuthConfig updates every field of an oauth_configs row in place
+// when ANY of them differs from what's stored, and — only when something
+// actually changed — cascades every token bound to that config to
+// needs_reauth in the same transaction, regardless of which auth_mode holds
+// it (shared/user/vk/session/admin alike).
+//
+// Every field is treated uniformly on purpose: a changed authorize_url or
+// token_url can point a client at a different identity provider entirely,
+// and a changed scopes/resource set means already-issued tokens were
+// consented under permissions that no longer match — cascading needs_reauth
+// for those is exactly as necessary as it is for client_id/client_secret.
+// Erring toward over-invalidating a session is the safer default here, not
+// a heavier one.
+//
+// Shared by the update-MCP-client API handler and the config.json sync path
+// so OAuth config changes behave identically from both entry points.
+//
+// existingOauthConfig is assigned CLONES of fields.ClientID/ClientSecret,
+// not the caller's own pointers: UpdateOauthConfig's GORM Save triggers
+// TableOauthConfig.BeforeSave, which encrypts ClientSecret.Val in place when
+// encryption is enabled. Aliasing would silently turn the caller's own
+// SecretVar (e.g. the request body's or a reused authorizedOauth row's) into
+// ciphertext as a side effect of this call.
+//
+// Returns whether a rotation actually happened.
+func (s *RDBConfigStore) RotateMCPOAuthConfig(ctx context.Context, existingOauthConfig *tables.TableOauthConfig, fields MCPOAuthConfigFields) (bool, error) {
+	if existingOauthConfig == nil {
+		return false, fmt.Errorf("oauth config is nil")
+	}
+	if !fields.DiffersFrom(existingOauthConfig) {
+		return false, nil
+	}
+
+	existingOauthConfig.ClientID = fields.ClientID.Clone()
+	existingOauthConfig.ClientSecret = fields.ClientSecret.Clone()
+	existingOauthConfig.AuthorizeURL = fields.AuthorizeURL
+	existingOauthConfig.TokenURL = fields.TokenURL
+	if fields.RegistrationURL == "" {
+		existingOauthConfig.RegistrationURL = nil
+	} else {
+		registrationURL := fields.RegistrationURL
+		existingOauthConfig.RegistrationURL = &registrationURL
+	}
+	existingOauthConfig.Resource = fields.Resource
+	scopesJSON, err := json.Marshal(fields.Scopes)
+	if err != nil {
+		return false, fmt.Errorf("failed to encode scopes: %w", err)
+	}
+	existingOauthConfig.Scopes = string(scopesJSON)
+
+	oauthConfigID := existingOauthConfig.ID
+	err = s.ExecuteTransaction(ctx, func(tx *gorm.DB) error {
+		if err := s.UpdateOauthConfig(ctx, existingOauthConfig, tx); err != nil {
+			return fmt.Errorf("failed to update oauth config: %w", err)
+		}
+		if err := s.MarkTokensNeedsReauthByConfigID(ctx, oauthConfigID, tx); err != nil {
+			return fmt.Errorf("failed to invalidate existing tokens: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // GetOauthUserTokenByID looks up a single per-user token row by primary key.

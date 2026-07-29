@@ -165,12 +165,6 @@ export default function MCPClientSheet({
 	const [vkConfigsDirty, setVKConfigsDirty] = useState(false);
 	const [allowedExtraHeadersRaw, setAllowedExtraHeadersRaw] = useState<string>((mcpClient.config.allowed_extra_headers || []).join(", "));
 	const [perUserHeaderKeysRaw, setPerUserHeaderKeysRaw] = useState<string>((mcpClient.config.per_user_header_keys || []).join(", "));
-	const [oauthFlow, setOauthFlow] = useState<{
-		authorizeUrl: string;
-		oauthConfigId: string;
-		mcpClientId: string;
-		isPerUserOauth?: boolean;
-	} | null>(null);
 	// Persists names for newly added VKs so they survive search result changes
 	const [localVKNames, setLocalVKNames] = useState<Record<string, string>>({});
 
@@ -208,8 +202,8 @@ export default function MCPClientSheet({
 		],
 		[allToolNames],
 	);
-	const supportsOAuthCredentialUpdate = false;
-	// mcpClient.config.auth_type === "oauth" || mcpClient.config.auth_type === "per_user_oauth";
+	const supportsOAuthCredentialUpdate =
+		mcpClient.config.auth_type === "oauth" || mcpClient.config.auth_type === "per_user_oauth";
 
 	const addVKConfig = ({ value: vkId, label }: { value: string; label: string }) => {
 		setLocalVKNames((prev) => ({ ...prev, [vkId]: label }));
@@ -295,9 +289,13 @@ export default function MCPClientSheet({
 				}
 				: undefined,
 		});
-	}, [form, mcpClient]);
+	}, [form, mcpClient, supportsOAuthCredentialUpdate]);
 
 	const isDirty = form.formState.isDirty || vkConfigsDirty;
+	// dirtyFields tracks deep changes vs. the pre-populated default values —
+	// used both to gate the rotation warning below and, in onSubmit, to only
+	// rotate when the user actually changed a credential field.
+	const oauthCredentialsDirty = !!(form.formState.dirtyFields.oauth_config?.client_id || form.formState.dirtyFields.oauth_config?.client_secret);
 
 	const handleNavigate = useCallback(
 		(direction: "prev" | "next") => {
@@ -330,10 +328,8 @@ export default function MCPClientSheet({
 			const oauthClientID = data.oauth_config?.client_id;
 			const oauthClientSecret = data.oauth_config?.client_secret;
 			// Only rotate when the user actually changed a credential field.
-			// dirtyFields tracks deep changes vs. the pre-populated default values.
-			const oauthDirty = !!(form.formState.dirtyFields.oauth_config?.client_id || form.formState.dirtyFields.oauth_config?.client_secret);
-			const shouldRotateOAuthCredentials = supportsOAuthCredentialUpdate && oauthDirty;
-			const response = await updateMCPClient({
+			const shouldRotateOAuthCredentials = supportsOAuthCredentialUpdate && oauthCredentialsDirty;
+			await updateMCPClient({
 				id: mcpClient.config.client_id,
 				data: {
 					name: data.name,
@@ -365,16 +361,6 @@ export default function MCPClientSheet({
 					vk_configs: vkConfigsDirty ? vkConfigs : undefined,
 				},
 			}).unwrap();
-
-			if (response.status === "pending_oauth" && response.authorize_url) {
-				setOauthFlow({
-					authorizeUrl: response.authorize_url,
-					oauthConfigId: response.oauth_config_id,
-					mcpClientId: response.mcp_client_id,
-					isPerUserOauth: mcpClient.config.auth_type === "per_user_oauth",
-				});
-				return;
-			}
 
 			toast({
 				title: "Success",
@@ -496,7 +482,7 @@ export default function MCPClientSheet({
 
 	return (
 		<>
-			<Sheet open onOpenChange={(open) => !open && !oauthFlow && !bootstrapAuthorize && !bootstrapHeadersOpen && onClose()}>
+			<Sheet open onOpenChange={(open) => !open && !bootstrapAuthorize && !bootstrapHeadersOpen && onClose()}>
 				<SheetContent className="flex w-full flex-col overflow-x-hidden pt-4 sm:max-w-[60%]">
 					<SheetHeader className="w-full p-0 px-8 py-4" showCloseButton={false} headerClassName="mb-0 sticky -top-4 bg-card z-10">
 						<div className="flex w-full items-center justify-between">
@@ -1052,9 +1038,20 @@ export default function MCPClientSheet({
 												<p>OAuth credentials cannot be rotated while the client is disabled. Re-enable the client to update credentials.</p>
 											</div>
 										) : (
-											<p className="text-muted-foreground text-sm">
-												Update OAuth client credentials only. Connection type, auth type, and connection URL cannot be changed.
-											</p>
+											<>
+												<p className="text-muted-foreground text-sm">
+													Update OAuth client credentials only. Connection type, auth type, and connection URL cannot be changed.
+												</p>
+												{oauthCredentialsDirty && (
+													<div className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
+														<Info className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+														<p>
+															Changing the client ID or secret immediately signs out every current session on this MCP client — shared and
+															per-user alike. Everyone will need to re-authenticate.
+														</p>
+													</div>
+												)}
+											</>
 										)}
 										<div className="grid grid-cols-1 gap-4 md:grid-cols-2">
 											<FormField
@@ -1513,24 +1510,6 @@ export default function MCPClientSheet({
 						</form>
 					</Form>
 				</SheetContent>
-				{oauthFlow && (
-					<OAuth2Authorizer
-						open={!!oauthFlow}
-						onClose={() => setOauthFlow(null)}
-						onSuccess={() => {
-							toast({ title: "Success", description: "MCP client OAuth credentials updated successfully" });
-							onSubmitSuccess();
-							onClose();
-						}}
-						onError={(error) => {
-							toast({ title: "Error", description: error, variant: "destructive" });
-						}}
-						authorizeUrl={oauthFlow.authorizeUrl}
-						oauthConfigId={oauthFlow.oauthConfigId}
-						mcpClientId={oauthFlow.mcpClientId}
-						isPerUserOauth={oauthFlow.isPerUserOauth}
-					/>
-				)}
 				{bootstrapAuthorize && (
 					<OAuth2Authorizer
 						open={!!bootstrapAuthorize}

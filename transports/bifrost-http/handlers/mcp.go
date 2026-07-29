@@ -1510,87 +1510,102 @@ func (h *MCPHandler) updateMCPClient(ctx *fasthttp.RequestCtx) {
 		}
 	}
 
-	// OAuth credential rotation is temporarily disabled.
-	if req.OauthConfig != nil {
-		SendError(ctx, fasthttp.StatusBadRequest, "updating oauth_config is not supported")
+	// OAuth config rotation: update every oauth_configs field in place (no new
+	// row, no re-discovery/re-registration triggered here) when ANY of them
+	// differs from what's stored, then cascade every token bound to that
+	// config to needs_reauth regardless of which auth_mode holds it. Every
+	// field is treated uniformly — not just client_id/client_secret — since a
+	// changed authorize_url/token_url can point at a different identity
+	// provider, and changed scopes/resource mean already-issued tokens were
+	// consented under permissions that no longer apply. The next reconnect
+	// (shared clients) or next tool call (per-user, via the existing
+	// needs_reauth->reauth-URL path) surfaces the requirement to
+	// re-authenticate — no new plumbing needed.
+	shouldRotateOAuthConfig := req.OauthConfig != nil &&
+		(existingConfig.AuthType == schemas.MCPAuthTypeOauth || existingConfig.AuthType == schemas.MCPAuthTypePerUserOauth)
+	if req.OauthConfig != nil && !shouldRotateOAuthConfig {
+		SendError(ctx, fasthttp.StatusBadRequest, "oauth_config can only be updated for MCP clients using auth_type 'oauth' or 'per_user_oauth'")
 		return
 	}
-	// shouldRotateOAuthConfig := req.OauthConfig != nil && (existingConfig.AuthType == schemas.MCPAuthTypeOauth || existingConfig.AuthType == schemas.MCPAuthTypePerUserOauth)
-	// var oauthClientID *schemas.SecretVar
-	// var oauthClientSecret *schemas.SecretVar
-	// oauthAuthorizeURL := ""
-	// oauthTokenURL := ""
-	// oauthRegistrationURL := ""
-	// oauthScopes := []string{}
-	// if req.OauthConfig != nil && !shouldRotateOAuthConfig {
-	// 	SendError(ctx, fasthttp.StatusBadRequest, "oauth_config can only be updated for MCP clients using auth_type 'oauth' or 'per_user_oauth'")
-	// 	return
-	// }
-	// if shouldRotateOAuthConfig && disabled {
-	// 	SendError(ctx, fasthttp.StatusBadRequest, "oauth credentials cannot be rotated while disabling a client; send these as two separate requests")
-	// 	return
-	// }
-	// if shouldRotateOAuthConfig {
-	// 	if req.OauthConfig.ClientID.ShouldPreserveStored() && req.OauthConfig.ClientSecret.ShouldPreserveStored() {
-	// 		shouldRotateOAuthConfig = false
-	// 	}
-	// }
-	// if shouldRotateOAuthConfig {
-	// 	oauthClientID = req.OauthConfig.ClientID
-	// 	oauthClientSecret = req.OauthConfig.ClientSecret
-	// 	oauthAuthorizeURL = strings.TrimSpace(req.OauthConfig.AuthorizeURL)
-	// 	oauthTokenURL = strings.TrimSpace(req.OauthConfig.TokenURL)
-	// 	oauthRegistrationURL = strings.TrimSpace(req.OauthConfig.RegistrationURL)
-	// 	oauthScopes = req.OauthConfig.Scopes
-	// 	if !oauthClientID.IsSet() && !oauthClientSecret.IsSet() {
-	// 		SendError(ctx, fasthttp.StatusBadRequest, "oauth_config.client_id or oauth_config.client_secret is required when updating OAuth credentials")
-	// 		return
-	// 	}
-	// 	var existingOauthConfig *configstoreTables.TableOauthConfig
-	// 	if existingConfig.OauthConfigID != nil && *existingConfig.OauthConfigID != "" {
-	// 		existingOauthConfig, err = h.store.ConfigStore.GetOauthConfigByID(ctx, *existingConfig.OauthConfigID)
-	// 		if err != nil {
-	// 			SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("failed to get existing OAuth config: %v", err))
-	// 			return
-	// 		}
-	// 		if existingOauthConfig != nil {
-	// 			if oauthAuthorizeURL == "" {
-	// 				oauthAuthorizeURL = strings.TrimSpace(existingOauthConfig.AuthorizeURL)
-	// 			}
-	// 			if oauthTokenURL == "" {
-	// 				oauthTokenURL = strings.TrimSpace(existingOauthConfig.TokenURL)
-	// 			}
-	// 			if oauthRegistrationURL == "" && existingOauthConfig.RegistrationURL != nil {
-	// 				oauthRegistrationURL = strings.TrimSpace(*existingOauthConfig.RegistrationURL)
-	// 			}
-	// 			if len(oauthScopes) == 0 && strings.TrimSpace(existingOauthConfig.Scopes) != "" {
-	// 				var existingScopes []string
-	// 				if err := json.Unmarshal([]byte(existingOauthConfig.Scopes), &existingScopes); err != nil {
-	// 					SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("failed to parse existing OAuth scopes: %v", err))
-	// 					return
-	// 				}
-	// 				oauthScopes = existingScopes
-	// 			}
-	// 		}
-	// 	}
-	// 	if !oauthClientID.IsSet() || oauthClientID.ShouldPreserveStored() {
-	// 		if existingOauthConfig == nil || !existingOauthConfig.ClientID.IsSet() {
-	// 			SendError(ctx, fasthttp.StatusBadRequest, "existing OAuth client_id not found; provide oauth_config.client_id")
-	// 			return
-	// 		}
-	// 		oauthClientID = existingOauthConfig.ClientID // preserve env var reference
-	// 	}
-	// 	if !oauthClientSecret.IsSet() || oauthClientSecret.ShouldPreserveStored() {
-	// 		if existingOauthConfig != nil {
-	// 			oauthClientSecret = existingOauthConfig.ClientSecret // preserve stored secret
-	// 		}
-	// 	}
-	// 	requiresDiscoveryOrRegistration := !oauthClientID.IsSet() || oauthAuthorizeURL == "" || oauthTokenURL == ""
-	// 	if requiresDiscoveryOrRegistration && (existingConfig.ConnectionString == nil || existingConfig.ConnectionString.GetValue() == "") {
-	// 		SendError(ctx, fasthttp.StatusBadRequest, "existing connection_string is required when OAuth discovery or dynamic registration is needed")
-	// 		return
-	// 	}
-	// }
+	var existingOauthConfig *configstoreTables.TableOauthConfig
+	var resolvedOauthFields configstore.MCPOAuthConfigFields
+	if shouldRotateOAuthConfig {
+		if existingConfig.OauthConfigID == nil || *existingConfig.OauthConfigID == "" {
+			SendError(ctx, fasthttp.StatusInternalServerError, "oauth config not found for this MCP client")
+			return
+		}
+		var err error
+		existingOauthConfig, err = h.store.ConfigStore.GetOauthConfigByID(ctx, *existingConfig.OauthConfigID)
+		if err != nil {
+			SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("failed to get existing OAuth config: %v", err))
+			return
+		}
+		if existingOauthConfig == nil {
+			SendError(ctx, fasthttp.StatusInternalServerError, "oauth config not found for this MCP client")
+			return
+		}
+		// Resolve what every field would become: preserve the stored value
+		// for any field the caller left unset. client_id/client_secret use
+		// SecretVar's own masked-placeholder convention; the plain-string/
+		// slice fields use the same "empty means not provided" convention
+		// the config.json path already uses for this block.
+		resolvedOauthFields = configstore.MCPOAuthConfigFields{
+			ClientID:        existingOauthConfig.ClientID,
+			ClientSecret:    existingOauthConfig.ClientSecret,
+			AuthorizeURL:    existingOauthConfig.AuthorizeURL,
+			TokenURL:        existingOauthConfig.TokenURL,
+			RegistrationURL: "",
+			Resource:        existingOauthConfig.Resource,
+			Scopes:          nil,
+		}
+		if existingOauthConfig.RegistrationURL != nil {
+			resolvedOauthFields.RegistrationURL = *existingOauthConfig.RegistrationURL
+		}
+		if existingOauthConfig.Scopes != "" {
+			_ = json.Unmarshal([]byte(existingOauthConfig.Scopes), &resolvedOauthFields.Scopes)
+		}
+		if !req.OauthConfig.ClientID.ShouldPreserveStored() {
+			resolvedOauthFields.ClientID = req.OauthConfig.ClientID
+		}
+		if !req.OauthConfig.ClientSecret.ShouldPreserveStored() {
+			resolvedOauthFields.ClientSecret = req.OauthConfig.ClientSecret
+		}
+		if trimmed := strings.TrimSpace(req.OauthConfig.AuthorizeURL); trimmed != "" {
+			resolvedOauthFields.AuthorizeURL = trimmed
+		}
+		if trimmed := strings.TrimSpace(req.OauthConfig.TokenURL); trimmed != "" {
+			resolvedOauthFields.TokenURL = trimmed
+		}
+		if trimmed := strings.TrimSpace(req.OauthConfig.RegistrationURL); trimmed != "" {
+			resolvedOauthFields.RegistrationURL = trimmed
+		}
+		if trimmed := strings.TrimSpace(req.OauthConfig.Resource); trimmed != "" {
+			resolvedOauthFields.Resource = trimmed
+		}
+		if len(req.OauthConfig.Scopes) > 0 {
+			resolvedOauthFields.Scopes = req.OauthConfig.Scopes
+		}
+		if !resolvedOauthFields.DiffersFrom(existingOauthConfig) {
+			// Every field resolved to what's already stored — either the
+			// caller left everything unset, or resent the same real values
+			// verbatim. Nothing actually changed, so skip the write and the
+			// reauth cascade entirely: a fetch-modify-put caller that
+			// round-trips oauth_config unchanged, or a request that pairs an
+			// unchanged oauth_config with a disable, must not invalidate
+			// every existing holder's token for no reason.
+			shouldRotateOAuthConfig = false
+		}
+	}
+	if shouldRotateOAuthConfig && disabled {
+		SendError(ctx, fasthttp.StatusBadRequest, "oauth credentials cannot be rotated while disabling a client; send these as two separate requests")
+		return
+	}
+	if shouldRotateOAuthConfig {
+		if _, err := h.store.ConfigStore.RotateMCPOAuthConfig(ctx, existingOauthConfig, resolvedOauthFields); err != nil {
+			SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("failed to rotate OAuth config: %v", err))
+			return
+		}
+	}
 
 	var oldDBConfig *configstoreTables.TableMCPClient
 	if h.store.ConfigStore != nil {
@@ -1835,44 +1850,6 @@ func (h *MCPHandler) updateMCPClient(ctx *fasthttp.RequestCtx) {
 			}
 		}
 	}
-
-	// if shouldRotateOAuthConfig {
-	// 	redirectURI := lib.BuildBaseURL(ctx, h.store.GetMCPExternalClientURL()) + "/api/oauth/callback"
-	// 	serverURL := ""
-	// 	if existingConfig.ConnectionString != nil {
-	// 		serverURL = existingConfig.ConnectionString.GetValue()
-	// 	}
-	// 	flowInitiation, err := h.oauthHandler.InitiateOAuthFlow(ctx, OAuthInitiationRequest{
-	// 		ClientID:        oauthClientID,
-	// 		ClientSecret:    oauthClientSecret,
-	// 		AuthorizeURL:    oauthAuthorizeURL,
-	// 		TokenURL:        oauthTokenURL,
-	// 		RegistrationURL: oauthRegistrationURL,
-	// 		RedirectURI:     redirectURI,
-	// 		Scopes:          oauthScopes,
-	// 		ServerURL:       serverURL,
-	// 	})
-	// 	if err != nil {
-	// 		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to initiate OAuth flow: %v", err))
-	// 		return
-	// 	}
-	// 	pendingConfig := *schemasConfig
-	// 	pendingConfig.OauthConfigID = &flowInitiation.OauthConfigID
-	// 	pendingConfig.Headers = req.Headers
-	// 	if err := h.oauthHandler.StorePendingMCPClient(flowInitiation.OauthConfigID, pendingConfig); err != nil {
-	// 		SendError(ctx, fasthttp.StatusInternalServerError, fmt.Sprintf("Failed to store pending MCP client update: %v", err))
-	// 		return
-	// 	}
-	// 	SendJSON(ctx, map[string]any{
-	// 		"status":          "pending_oauth",
-	// 		"message":         "MCP client updated. OAuth re-authorization is required to apply credential rotation.",
-	// 		"oauth_config_id": flowInitiation.OauthConfigID,
-	// 		"authorize_url":   flowInitiation.AuthorizeURL,
-	// 		"expires_at":      flowInitiation.ExpiresAt,
-	// 		"mcp_client_id":   req.ClientID,
-	// 	})
-	// 	return
-	// }
 
 	// Per-user credential reconciliation for changes that mutate who can
 	// access this MCP. Two trigger conditions:

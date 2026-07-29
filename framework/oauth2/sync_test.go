@@ -13,6 +13,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 
 	bifrost "github.com/maximhq/bifrost/core"
 	"github.com/maximhq/bifrost/core/schemas"
@@ -48,7 +49,7 @@ func (s *testConfigStore) GetOauthConfigByID(_ context.Context, id string) (*tab
 	return bifrost.Ptr(*cfg), nil
 }
 
-func (s *testConfigStore) UpdateOauthConfig(_ context.Context, cfg *tables.TableOauthConfig) error {
+func (s *testConfigStore) UpdateOauthConfig(_ context.Context, cfg *tables.TableOauthConfig, _ ...*gorm.DB) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.oauthConfigs[cfg.ID] = bifrost.Ptr(*cfg)
@@ -99,6 +100,19 @@ func (s *testConfigStore) MarkOauthUserTokenNeedsReauthByID(_ context.Context, t
 		return nil
 	}
 	token.Status = "needs_reauth"
+	return nil
+}
+
+// MarkTokensNeedsReauthByConfigID is the test-double equivalent of the real
+// store's bulk, auth_mode-agnostic cascade used by OAuth credential rotation.
+func (s *testConfigStore) MarkTokensNeedsReauthByConfigID(_ context.Context, oauthConfigID string, _ ...*gorm.DB) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, token := range s.oauthTokens {
+		if token.OauthConfigID == oauthConfigID {
+			token.Status = "needs_reauth"
+		}
+	}
 	return nil
 }
 
