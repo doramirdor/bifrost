@@ -32,6 +32,14 @@ type ClientManager interface {
 	// credentials) and closed on release. The credential-resolution error path
 	// (e.g. *MCPUserOAuthRequiredError) surfaces here.
 	AcquireClientConn(ctx *schemas.BifrostContext, state *schemas.MCPClientState) (*client.Client, func(), error)
+	// ReconnectClient tears down and re-establishes a shared-connection MCP
+	// client's persistent upstream connection by ID. Used outside its usual
+	// health-monitor/API callers to repair a shared connection in the
+	// background after a live tool call hits a clean upstream auth
+	// rejection — see attemptAuthFailureRecovery. No-op-with-error for
+	// per-call-connection (per-user) auth types, matching its existing
+	// contract.
+	ReconnectClient(id string) error
 	// RunWithPluginPipeline wraps an MCP wire operation in the canonical plugin
 	// gate (PreMCPHooks → op → PostMCPHooks). It owns the tracing span,
 	// MCPRequestType/ClientName/ToolName stamping, plugin log draining, and
@@ -716,6 +724,20 @@ func (m *ToolsManager) executeToolInternal(
 		if toolCtx.Err() == context.DeadlineExceeded {
 			return nil, "", "", fmt.Errorf("MCP tool call timed out after %v: %s: %w", toolExecutionTimeout, toolName, ErrMCPToolTimeout)
 		}
+
+		// A clean upstream auth rejection on an otherwise-healthy connection
+		// (AcquireClientConn already succeeded once to get this far) means
+		// Bifrost's own credential bookkeeping and the upstream server
+		// disagree about whether it's still valid. React to it instead of
+		// surfacing an opaque failure — see attemptAuthFailureRecovery for
+		// the per-auth-type mechanics.
+		if isAuthFailureErrorText(callErr.Error()) {
+			if retryResponse, recovered := m.attemptAuthFailureRecovery(ctx, toolName, callRequest, executionConfig, toolExecutionTimeout); recovered {
+				responseText := extractTextFromMCPResponse(retryResponse, toolName)
+				return createToolResponseMessage(*toolCall, responseText), executionConfig.Name, sanitizedToolName, nil
+			}
+		}
+
 		m.logger.Error("%s Tool execution failed for %s via client %s: %v", MCPLogPrefix, toolName, executionConfig.Name, callErr)
 		return nil, "", "", fmt.Errorf("MCP tool call failed for %s: %v: %w", toolName, callErr, ErrMCPToolCallFailed)
 	}
@@ -725,6 +747,126 @@ func (m *ToolsManager) executeToolInternal(
 
 	// Create tool response message
 	return createToolResponseMessage(*toolCall, responseText), executionConfig.Name, sanitizedToolName, nil
+}
+
+// attemptAuthFailureRecovery reacts to a clean upstream auth rejection
+// (401/403/unauthorized/forbidden) on a live tool call. The mechanics differ
+// by auth type:
+//
+//   - Per-user (RequiresPerCallConnection==true): cheap and ephemeral, no
+//     rate limiter guards it — force a credential refresh, re-acquire a
+//     fresh connection, and retry the SAME call synchronously, exactly once.
+//   - Shared (RequiresPerCallConnection==false): a synchronous ReconnectClient
+//     chains multiple retried connection steps and can itself take minutes —
+//     far longer than this call's own timeout budget — and there is no way
+//     to swap just the bearer header on an already-open transport. Fail this
+//     call immediately and repair the connection out of band instead, so the
+//     NEXT call succeeds.
+//
+// Returns (response, true) only when a synchronous retry ran and actually
+// succeeded — the only case where the caller should treat this as a success
+// instead of the original failure. Every other outcome (opt-out gate,
+// shared-connection fail-fast, retry-also-failed) is (nil, false).
+func (m *ToolsManager) attemptAuthFailureRecovery(
+	ctx *schemas.BifrostContext,
+	toolName string,
+	callRequest mcp.CallToolRequest,
+	executionConfig *schemas.MCPClientConfig,
+	toolExecutionTimeout time.Duration,
+) (*mcp.CallToolResult, bool) {
+	state := m.clientManager.GetClientForTool(toolName)
+
+	// Safety opt-out: a spurious retry against a destructive, non-idempotent
+	// tool could cause a real-world side effect twice. Let the original
+	// error surface normally instead of auto-retrying.
+	if state != nil {
+		if tool, ok := state.ToolMap[toolName]; ok && tool.Annotations != nil {
+			destructive := tool.Annotations.DestructiveHint != nil && *tool.Annotations.DestructiveHint
+			idempotent := tool.Annotations.IdempotentHint != nil && *tool.Annotations.IdempotentHint
+			if destructive && !idempotent {
+				m.logger.Debug("%s Skipping auth-failure auto-retry for destructive, non-idempotent tool %s", MCPLogPrefix, toolName)
+				return nil, false
+			}
+		}
+	}
+
+	if !m.credStore.RequiresPerCallConnection(executionConfig) {
+		m.triggerBackgroundReconnect(executionConfig)
+		return nil, false
+	}
+
+	if state == nil {
+		// No client state means no connection to re-acquire — nothing to retry.
+		return nil, false
+	}
+
+	if err := m.credStore.ForceRefresh(ctx, executionConfig); err != nil {
+		// Not fatal to the retry attempt itself: the forced refresh may fail
+		// because there's nothing to refresh yet, or because the token is
+		// permanently dead — in the latter case the refresh path has already
+		// flipped the token row to needs_reauth, and the AcquireClientConn
+		// call below will surface that through the existing per-user
+		// re-auth error path on its own. Either way, still attempt the
+		// retry with whatever credential resolves.
+		m.logger.Debug("%s Forced credential refresh before retry failed for %s (retrying anyway): %v", MCPLogPrefix, executionConfig.Name, err)
+	}
+
+	conn, release, err := m.clientManager.AcquireClientConn(ctx, state)
+	if err != nil {
+		m.logger.Debug("%s Auth-failure retry could not re-acquire a connection for %s: %v", MCPLogPrefix, toolName, err)
+		return nil, false
+	}
+	defer release()
+
+	retryCtx, cancel := context.WithTimeout(ctx, toolExecutionTimeout)
+	defer cancel()
+
+	retryStart := time.Now()
+	retryResponse, retryErr := conn.CallTool(retryCtx, callRequest)
+	schemas.AddUpstreamLatency(ctx, time.Since(retryStart))
+	if retryErr != nil {
+		m.logger.Debug("%s Auth-failure retry also failed for %s: %v", MCPLogPrefix, toolName, retryErr)
+		return nil, false
+	}
+
+	m.logger.Debug("%s Auth-failure retry succeeded for %s", MCPLogPrefix, toolName)
+	return retryResponse, true
+}
+
+// triggerBackgroundReconnect forces a credential refresh and reconnects a
+// shared-connection MCP client in the background, mirroring the health
+// monitor's own background-reconnect pattern (ClientHealthMonitor.
+// attemptReconnect). Used when a live tool call hits a clean upstream auth
+// rejection: this repairs the connection immediately instead of waiting on
+// the health monitor's independent ping-failure cycle to eventually notice.
+//
+// Runs on a fresh background context — the caller's request context ends as
+// soon as attemptAuthFailureRecovery returns the original failure to the
+// tool call's caller.
+func (m *ToolsManager) triggerBackgroundReconnect(config *schemas.MCPClientConfig) {
+	if config == nil {
+		return
+	}
+	clientID := config.ID
+	clientName := config.Name
+	go func() {
+		refreshCtx, cancel := context.WithTimeout(context.Background(), MCPClientConnectionEstablishTimeout)
+		bgCtx := schemas.NewBifrostContext(refreshCtx, schemas.NoDeadline)
+		if err := m.credStore.ForceRefresh(bgCtx, config); err != nil {
+			// Not fatal — connectToMCPClient's own credential resolution
+			// (invoked by ReconnectClient below) applies the same
+			// needs_reauth classification on a permanent failure regardless
+			// of whether this forced refresh ran first.
+			m.logger.Debug("%s Background forced refresh ahead of reconnect failed for %s (reconnect will still run): %v", MCPLogPrefix, clientName, err)
+		}
+		cancel()
+
+		if err := m.clientManager.ReconnectClient(clientID); err != nil {
+			m.logger.Debug("%s Background reconnect triggered by an upstream auth rejection did not complete for %s: %v", MCPLogPrefix, clientName, err)
+			return
+		}
+		m.logger.Info("%s Background reconnect triggered by an upstream auth rejection succeeded for %s", MCPLogPrefix, clientName)
+	}()
 }
 
 // ExecuteAgentForChatRequest executes agent mode for a chat request, handling
