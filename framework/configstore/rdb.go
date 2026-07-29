@@ -6215,6 +6215,26 @@ func (s *RDBConfigStore) GetOauthTokenByID(ctx context.Context, id string) (*tab
 	return &token, nil
 }
 
+// GetSharedOauthTokenByConfigID resolves the single shared-mode token row for
+// a config — the replacement for the retired TableOauthConfig.TokenID FK
+// shortcut. Not filtered by status: RevokeToken needs to reach a
+// 'needs_reauth' row too, to delete it; GetAccessToken (the one caller that
+// only wants a usable credential) checks token.Status itself after the load.
+func (s *RDBConfigStore) GetSharedOauthTokenByConfigID(ctx context.Context, oauthConfigID string) (*tables.TableMCPOauthToken, error) {
+	if oauthConfigID == "" {
+		return nil, nil
+	}
+	var token tables.TableMCPOauthToken
+	result := s.DB().WithContext(ctx).Where("oauth_config_id = ? AND auth_mode = ?", oauthConfigID, "shared").First(&token)
+	if result.Error != nil {
+		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get shared oauth token by config id: %w", result.Error)
+	}
+	return &token, nil
+}
+
 // CreateOauthConfig creates a new OAuth config
 func (s *RDBConfigStore) CreateOauthConfig(ctx context.Context, config *tables.TableOauthConfig) error {
 	result := s.DB().WithContext(ctx).Create(config)
@@ -6272,12 +6292,12 @@ func (s *RDBConfigStore) DeleteOauthToken(ctx context.Context, id string) error 
 // GetExpiringOauthTokens retrieves tokens that are expiring before the given time
 func (s *RDBConfigStore) GetExpiringOauthTokens(ctx context.Context, before time.Time) ([]*tables.TableMCPOauthToken, error) {
 	var tokens []*tables.TableMCPOauthToken
-	// Exclude tokens whose owning oauth_config has already reached a terminal
-	// state — "expired" (set when a refresh is permanently rejected, e.g.
-	// invalid_grant / Grant not found) or "revoked". Without this, the refresh
-	// worker re-selects a permanently-dead token on every tick (its expires_at
-	// stays in the past) and logs the same failure indefinitely; a dead grant
-	// needs re-authorization, not perpetual retries.
+	// Only select tokens whose own status is 'active' — a token already
+	// flagged 'needs_reauth' (a prior refresh attempt was permanently
+	// rejected, e.g. invalid_grant / 401) stays dead until a human
+	// re-authorizes it. Without this, the refresh worker would re-select a
+	// confirmed-dead token on every tick and log the same failure
+	// indefinitely.
 	//
 	// Refresh is also limited to tokens whose oauth_config is referenced by
 	// at least one enabled MCP client: nothing consumes a token while every
@@ -6291,34 +6311,18 @@ func (s *RDBConfigStore) GetExpiringOauthTokens(ctx context.Context, before time
 		// as a side effect of the table merge (that's a deliberate later
 		// change, not this one).
 		Where("auth_mode = ?", "shared").
+		Where("status = ?", "active").
 		Where("expires_at IS NOT NULL AND expires_at < ?", before).
-		Where("NOT EXISTS (?)",
-			s.DB().Model(&tables.TableOauthConfig{}).
-				Select("1").
-				Where("oauth_configs.token_id = mcp_oauth_tokens.id AND oauth_configs.status IN ?", []string{"expired", "revoked"})).
 		Where("EXISTS (?)",
 			s.DB().Model(&tables.TableMCPClient{}).
 				Select("1").
 				Joins("JOIN oauth_configs ON oauth_configs.id = config_mcp_clients.oauth_config_id").
-				Where("oauth_configs.token_id = mcp_oauth_tokens.id AND config_mcp_clients.disabled = ?", false)).
+				Where("oauth_configs.id = mcp_oauth_tokens.oauth_config_id AND config_mcp_clients.disabled = ?", false)).
 		Find(&tokens)
 	if result.Error != nil {
 		return nil, fmt.Errorf("failed to get expiring tokens: %w", result.Error)
 	}
 	return tokens, nil
-}
-
-// GetOauthConfigByTokenID retrieves an OAuth config that references a specific token
-func (s *RDBConfigStore) GetOauthConfigByTokenID(ctx context.Context, tokenID string) (*tables.TableOauthConfig, error) {
-	var config tables.TableOauthConfig
-	result := s.DB().WithContext(ctx).Where("token_id = ?", tokenID).First(&config)
-	if result.Error != nil {
-		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("failed to get oauth config by token id: %w", result.Error)
-	}
-	return &config, nil
 }
 
 // ---------- OAuth Flow CRUD (mcp_oauth_flows) ----------
@@ -6332,12 +6336,19 @@ func (s *RDBConfigStore) GetOauthConfigByTokenID(ctx context.Context, tokenID st
 var perUserOauthFlowModes = perUserOauthAuthModes
 
 // GetOauthUserSessionByID retrieves a flow row by its ID
+// GetOauthUserSessionByID looks up a per-identity flow row by its own ID —
+// fed a caller-supplied ID from a URL path parameter (BuildUpstreamAuthorizeURL,
+// mcpsessions.go's loadAuthorizedFlow), so the flow_mode filter matters here
+// the same way it does on GetOauthUserTokenByID: without it, an admin-mode
+// row (the shared client's or a bootstrap-test's one-time setup flow) could
+// be fetched through a per-user-facing endpoint just by guessing/reusing its
+// ID. Both current callers are documented as per-user-only.
 func (s *RDBConfigStore) GetOauthUserSessionByID(ctx context.Context, id string) (*tables.TableMCPOauthFlow, error) {
 	var flow tables.TableMCPOauthFlow
 	result := s.ScopedDB(ctx).
 		Preload("MCPClient", func(db *gorm.DB) *gorm.DB { return db.Select("client_id, name") }).
 		Preload("VirtualKey", func(db *gorm.DB) *gorm.DB { return db.Select("id, name") }).
-		Where("id = ?", id).First(&flow)
+		Where("id = ? AND flow_mode IN ?", id, perUserOauthFlowModes).First(&flow)
 	if result.Error != nil {
 		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
 			return nil, nil
@@ -6640,18 +6651,22 @@ func (s *RDBConfigStore) GetOauthUserTokenByMode(ctx context.Context, mode schem
 }
 
 // MarkOauthUserTokenNeedsReauthByID flips status to 'needs_reauth' on a single
-// token row. Called by the refresh-failure path when the upstream credential
-// is permanently rejected: the row stays (preserves audit + binding for
-// re-auth), but is filtered from active lookups so the next inference
-// triggers a fresh OAuth flow. Scoped to auth_mode IN ('user','vk','session')
-// so this per-user-only path can never flip a shared token to needs_reauth.
+// token row, regardless of auth_mode. Called by the unified refresh function
+// when the upstream credential is permanently rejected: the row stays
+// (preserves audit + binding for re-auth), but is filtered from active
+// lookups so the next inference/access triggers a fresh OAuth flow. Not
+// scoped by auth_mode (unlike GetOauthUserTokenByID/UpdateOauthUserToken
+// below): the ID handed in always comes from an internal lookup already
+// (a token row just loaded by its own refresh path), never an arbitrary
+// caller-supplied ID, so a 'shared' row is just as safe to flip here as a
+// per-identity one.
 func (s *RDBConfigStore) MarkOauthUserTokenNeedsReauthByID(ctx context.Context, tokenID string) error {
 	if tokenID == "" {
 		return nil
 	}
 	result := s.DB().WithContext(ctx).
 		Model(&tables.TableMCPOauthToken{}).
-		Where("id = ? AND auth_mode IN ?", tokenID, perUserOauthAuthModes).
+		Where("id = ?", tokenID).
 		Update("status", "needs_reauth")
 	if result.Error != nil {
 		return fmt.Errorf("failed to mark oauth user token %s needs_reauth: %w", tokenID, result.Error)
