@@ -126,6 +126,10 @@ export default function MCPClientSheet({
 	// Drives the MCPHeadersAuthorizer dialog for a config.json-bootstrapped
 	// per_user_headers client sitting in pending_verification.
 	const [bootstrapHeadersOpen, setBootstrapHeadersOpen] = useState(false);
+	// Drives the MCPHeadersAuthorizer dialog for repairing an already-verified
+	// per_user_headers client whose retained admin discovery credential needs
+	// fresh sample values (state === "needs_reauth").
+	const [repairHeadersOpen, setRepairHeadersOpen] = useState(false);
 
 	const { toast } = useToast();
 
@@ -513,7 +517,7 @@ export default function MCPClientSheet({
 
 	return (
 		<>
-			<Sheet open onOpenChange={(open) => !open && !bootstrapAuthorize && !bootstrapHeadersOpen && !reauthorizeFlow && onClose()}>
+			<Sheet open onOpenChange={(open) => !open && !bootstrapAuthorize && !bootstrapHeadersOpen && !repairHeadersOpen && !reauthorizeFlow && onClose()}>
 				<SheetContent className="flex w-full flex-col overflow-x-hidden pt-4 sm:max-w-[60%]">
 					<SheetHeader className="w-full p-0 px-8 py-4" showCloseButton={false} headerClassName="mb-0 sticky -top-4 bg-card z-10">
 						<div className="flex w-full items-center justify-between">
@@ -523,15 +527,23 @@ export default function MCPClientSheet({
 									{isPerUserAuth ? (
 										// Per-user clients never hold a shared upstream connection, so a
 										// connection-state badge here would be misleading: point to the
-										// per-user sessions this client actually has instead.
-										<Link
-											to="/workspace/mcp-sessions"
-											search={{ mcp_client_id: [mcpClient.config.client_id] }}
-											className="text-primary text-xs font-medium hover:underline"
-											data-testid="mcp-client-view-sessions-link"
-										>
-											View sessions
-										</Link>
+										// per-user sessions this client actually has instead. The one
+										// exception is needs_reauth, which for per-user clients means the
+										// retained admin discovery credential needs repair: surface that
+										// badge next to the link so the admin can act on it.
+										<>
+											<Link
+												to="/workspace/mcp-sessions"
+												search={{ mcp_client_id: [mcpClient.config.client_id] }}
+												className="text-primary text-xs font-medium hover:underline"
+												data-testid="mcp-client-view-sessions-link"
+											>
+												View sessions
+											</Link>
+											{mcpClient.state === "needs_reauth" && (
+												<Badge className={MCP_STATUS_COLORS[mcpClient.state]}>{mcpClient.state}</Badge>
+											)}
+										</>
 									) : (
 										<Badge className={MCP_STATUS_COLORS[mcpClient.state]}>{mcpClient.state}</Badge>
 									)}
@@ -551,18 +563,34 @@ export default function MCPClientSheet({
 													: "Verify"}
 										</Button>
 									)}
-									{mcpClient.state === "needs_reauth" && hasUpdateMCPClientAccess && (
-										<Button
-											type="button"
-											size="sm"
-											variant="default"
-											disabled={isReauthorizing}
-											onClick={handleReauthorize}
-											data-testid="mcp-reauthorize-btn"
-										>
-											{isReauthorizing ? "Starting…" : "Reauthorize"}
-										</Button>
-									)}
+									{mcpClient.state === "needs_reauth" &&
+										hasUpdateMCPClientAccess &&
+										(mcpClient.config.auth_type === "per_user_headers" ? (
+											<Button
+												type="button"
+												size="sm"
+												variant="default"
+												onClick={() => setRepairHeadersOpen(true)}
+												data-testid="mcp-repair-headers-btn"
+											>
+												Update headers
+											</Button>
+										) : (
+											<Button
+												type="button"
+												size="sm"
+												variant="default"
+												disabled={isReauthorizing}
+												onClick={handleReauthorize}
+												data-testid="mcp-reauthorize-btn"
+											>
+												{isReauthorizing
+													? "Starting…"
+													: mcpClient.config.auth_type === "per_user_oauth"
+														? "Repair OAuth"
+														: "Reauthorize"}
+											</Button>
+										))}
 								</SheetTitle>
 								<SheetDescription>
 									{mcpClient.state === "pending_verification"
@@ -570,7 +598,9 @@ export default function MCPClientSheet({
 											? "This client was declared in config.json. An admin sign-in is needed to verify the OAuth setup and discover tools; Bifrost keeps it on file to refresh the tool list periodically. Each user will still authenticate individually when they use this server."
 											: "This client was declared in config.json and needs a one-time OAuth authorization before it can be used."
 										: mcpClient.state === "needs_reauth"
-											? "This connection's credentials need to be re-authorized. Click Reauthorize to redo the OAuth consent flow."
+											? isPerUserAuth
+												? "The admin credential Bifrost keeps on file to refresh this server's tool list needs repair. End-user credentials and tool calls are unaffected."
+												: "This connection's credentials need to be re-authorized. Click Reauthorize to redo the OAuth consent flow."
 											: "MCP server configuration and available tools"}
 								</SheetDescription>
 							</div>
@@ -1583,7 +1613,13 @@ export default function MCPClientSheet({
 						open={!!reauthorizeFlow}
 						onClose={() => setReauthorizeFlow(null)}
 						onSuccess={() => {
-							toast({ title: "Success", description: "MCP client re-authorized successfully" });
+							toast({
+								title: "Success",
+								description:
+									mcpClient.config.auth_type === "per_user_oauth"
+										? "Admin discovery credential repaired successfully."
+										: "MCP client re-authorized successfully",
+							});
 							setReauthorizeFlow(null);
 							onSubmitSuccess();
 						}}
@@ -1593,18 +1629,25 @@ export default function MCPClientSheet({
 						authorizeUrl={reauthorizeFlow.authorizeUrl}
 						oauthConfigId={reauthorizeFlow.oauthConfigId}
 						mcpClientId={reauthorizeFlow.mcpClientId}
+						isPerUserOauth={mcpClient.config.auth_type === "per_user_oauth"}
 					/>
 				)}
-				{bootstrapHeadersOpen && (
+				{(bootstrapHeadersOpen || repairHeadersOpen) && (
 					<MCPHeadersAuthorizer
-						open={bootstrapHeadersOpen}
-						onClose={() => setBootstrapHeadersOpen(false)}
+						open={bootstrapHeadersOpen || repairHeadersOpen}
+						onClose={() => {
+							setBootstrapHeadersOpen(false);
+							setRepairHeadersOpen(false);
+						}}
 						onSuccess={() => {
 							toast({
 								title: "Success",
-								description: "Headers verified successfully. Each user will submit their own values when using this MCP server.",
+								description: repairHeadersOpen
+									? "Admin discovery credential updated successfully."
+									: "Headers verified successfully. Each user will submit their own values when using this MCP server.",
 							});
 							setBootstrapHeadersOpen(false);
+							setRepairHeadersOpen(false);
 							onSubmitSuccess();
 							onClose();
 						}}
@@ -1612,10 +1655,13 @@ export default function MCPClientSheet({
 							/* error state rendered by the dialog itself */
 						}}
 						onConflict={(error) => {
-							// 409: tools were already discovered (e.g. double submit or a
-							// concurrent verification) — the client is verified; refresh.
+							// 409: the server refused to re-run discovery; either tools
+							// were already discovered (double submit / concurrent
+							// verification) or the admin credential no longer needs
+							// repair; either way the client is fine, so refresh.
 							toast({ title: "Already verified", description: error });
 							setBootstrapHeadersOpen(false);
+							setRepairHeadersOpen(false);
 							onSubmitSuccess();
 						}}
 						perUserHeaderKeys={mcpClient.config.per_user_header_keys ?? []}

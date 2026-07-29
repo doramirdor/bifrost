@@ -488,15 +488,21 @@ export default function MCPClientsTable({
 												{isPerUserAuth ? (
 													// Per-user clients never hold a shared upstream connection, so a
 													// connection-state badge here would be misleading: point to the
-													// per-user sessions this client actually has instead.
-													<Link
-														to="/workspace/mcp-sessions"
-														search={{ mcp_client_id: [c.config.client_id] }}
-														className="text-primary text-xs font-medium hover:underline"
-														data-testid={`mcp-client-view-sessions-${c.config.client_id}`}
-													>
-														View sessions
-													</Link>
+													// per-user sessions this client actually has instead. The one
+													// exception is needs_reauth, which for per-user clients means the
+													// retained admin discovery credential needs repair: surface that
+													// badge next to the link so the admin can act on it.
+													<span className="flex items-center gap-2">
+														<Link
+															to="/workspace/mcp-sessions"
+															search={{ mcp_client_id: [c.config.client_id] }}
+															className="text-primary text-xs font-medium hover:underline"
+															data-testid={`mcp-client-view-sessions-${c.config.client_id}`}
+														>
+															View sessions
+														</Link>
+														{c.state === "needs_reauth" && <Badge className={MCP_STATUS_COLORS[c.state]}>{c.state}</Badge>}
+													</span>
 												) : (
 													<Badge className={MCP_STATUS_COLORS[c.state]}>{c.state}</Badge>
 												)}

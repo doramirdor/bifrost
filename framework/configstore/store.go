@@ -515,6 +515,18 @@ type ConfigStore interface {
 	// admin-mode counterpart — resolves the retained bootstrap-verification
 	// token for a per_user_oauth client's periodic tool-discovery refresh.
 	GetAdminOauthTokenByConfigID(ctx context.Context, oauthConfigID string) (*tables.TableMCPOauthToken, error)
+	// GetAdminOauthTokensByConfigIDs is GetAdminOauthTokenByConfigID's batch
+	// counterpart: resolves the retained admin-mode token row for each of the
+	// given oauth_config_ids in one query, keyed by OauthConfigID. Not
+	// filtered by status; configs with no admin row are absent from the map.
+	GetAdminOauthTokensByConfigIDs(ctx context.Context, oauthConfigIDs []string) (map[string]*tables.TableMCPOauthToken, error)
+	// PromoteSharedOauthTokenToAdmin transactionally installs the config's
+	// fresh shared-mode token as the retained admin-mode discovery credential
+	// for mcpClientID: if an admin row already exists its credential fields
+	// are replaced in place (preserving ID and CreatedAt) and the shared row
+	// is deleted; otherwise the shared row is retagged to auth_mode='admin'.
+	// Errors if the shared row is missing or not status='active'.
+	PromoteSharedOauthTokenToAdmin(ctx context.Context, oauthConfigID, mcpClientID string) error
 	// GetExpiringOauthTokens is filtered to authModes via `auth_mode IN
 	// (...)`. Backs TokenRefreshWorker, whose AuthModes field decides which
 	// holder types get proactive background refresh (defaults to shared +
@@ -668,13 +680,20 @@ type ConfigStore interface {
 	// mcp_client_id).
 	GetMCPPerUserHeaderCredentialByMode(ctx context.Context, mode schemas.MCPAuthMode, identity, mcpClientID string) (*tables.TableMCPPerUserHeaderCredential, error)
 	GetMCPPerUserHeaderCredentialByID(ctx context.Context, id string) (*tables.TableMCPPerUserHeaderCredential, error)
+	// GetAdminMCPPerUserHeaderCredentialsByClientIDs resolves the retained
+	// admin-mode header credential for each of the given MCP client IDs in
+	// one query, keyed by MCPClientID. Not filtered by status; clients with
+	// no admin row are absent from the map.
+	GetAdminMCPPerUserHeaderCredentialsByClientIDs(ctx context.Context, mcpClientIDs []string) (map[string]*tables.TableMCPPerUserHeaderCredential, error)
 	UpsertMCPPerUserHeaderCredential(ctx context.Context, cred *tables.TableMCPPerUserHeaderCredential) error
 	DeleteMCPPerUserHeaderCredential(ctx context.Context, id string) error
 	// ListMCPPerUserHeaderCredentials returns credential rows matching the
 	// supplied filters, regardless of status. Mirrors ListOauthUserTokens —
 	// the sessions UI surfaces non-active states (needs_update / orphaned)
 	// with distinct affordances, so status filtering is the caller's
-	// responsibility via params.Statuses.
+	// responsibility via params.Statuses. Always excludes auth_mode='admin'
+	// so the retained admin discovery credential never leaks into the
+	// per-identity sessions UI.
 	ListMCPPerUserHeaderCredentials(ctx context.Context, params MCPSessionsFilterParams) ([]tables.TableMCPPerUserHeaderCredential, error)
 	// MarkMCPPerUserHeaderCredentialsNeedsUpdate flips status to 'needs_update'
 	// for every row tied to mcpClientID. Called when the admin changes
