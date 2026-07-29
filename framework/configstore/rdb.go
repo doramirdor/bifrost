@@ -5571,13 +5571,18 @@ func (s *RDBConfigStore) UpdateComplexityAnalyzerConfig(ctx context.Context, con
 		txDB = tx[0]
 	}
 
-	if normalized.ConfigHashes.Empty() {
+	if normalized.ConfigHashes.Empty() || normalized.EmbeddingFingerprint == "" {
 		existing, err := s.getComplexityAnalyzerConfigWithDB(ctx, txDB)
 		if err != nil {
 			return err
 		}
 		if existing != nil {
-			normalized.ConfigHashes = existing.ConfigHashes
+			if normalized.ConfigHashes.Empty() {
+				normalized.ConfigHashes = existing.ConfigHashes
+			}
+			if normalized.EmbeddingFingerprint == "" {
+				normalized.EmbeddingFingerprint = existing.EmbeddingFingerprint
+			}
 		}
 	}
 
