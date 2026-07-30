@@ -529,6 +529,18 @@ func (h *ConfigHandler) updateConfig(ctx *fasthttp.RequestCtx) {
 
 	// Only update when explicitly provided to avoid clearing the stored default (prefer_idp)
 	if payload.ClientConfig.DualCredentialConflictBehavior != "" {
+		// The 'error' behavior rejects exactly the requests token_exchange
+		// clients rely on (an identity token alongside a virtual key), so
+		// the two settings are mutually exclusive — mirrored by the MCP
+		// client create path rejecting token_exchange while it is 'error'.
+		if payload.ClientConfig.DualCredentialConflictBehavior == configstoreTables.DualCredentialConflictBehaviorError && h.store.MCPConfig != nil {
+			for _, mcpClient := range h.store.MCPConfig.ClientConfigs {
+				if mcpClient.AuthType == schemas.MCPAuthTypeTokenExchange {
+					SendError(ctx, fasthttp.StatusBadRequest, fmt.Sprintf("dual_credential_conflict_behavior cannot be set to 'error' while MCP client %q uses auth_type 'token_exchange'; delete that client first or choose 'prefer_idp'/'prefer_vk'", mcpClient.Name))
+					return
+				}
+			}
+		}
 		updatedConfig.DualCredentialConflictBehavior = payload.ClientConfig.DualCredentialConflictBehavior
 	}
 
