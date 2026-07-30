@@ -585,9 +585,9 @@ type Config struct {
 	pluginStatusMu sync.RWMutex
 	pluginStatus   map[string]schemas.PluginStatus // name -> status
 
-	OAuthProvider      *oauth2.OAuth2Provider
-	TokenRefreshWorker *oauth2.TokenRefreshWorker
-	OAuthSweepWorker   *oauth2.PerUserOAuthSweepWorker
+	OAuthProvider           *oauth2.OAuth2Provider
+	OAuthTokenRefreshWorker *oauth2.OAuthTokenRefreshWorker
+	OAuthSweepWorker        *oauth2.PerUserOAuthSweepWorker
 
 	// MCPHeadersProvider backs MCPAuthTypePerUserHeaders credential storage.
 	// Constructed alongside OAuthProvider and passed into the Bifrost core
@@ -4761,9 +4761,9 @@ func initFrameworkConfig(ctx context.Context, config *Config, configData *Config
 	config.MCPHeadersProvider = mcp_headers.NewProvider(config.ConfigStore, logger)
 
 	// Start token refresh worker for automatic OAuth token refresh
-	config.TokenRefreshWorker = oauth2.NewTokenRefreshWorker(config.OAuthProvider, logger)
-	if config.TokenRefreshWorker != nil {
-		config.TokenRefreshWorker.Start(ctx)
+	config.OAuthTokenRefreshWorker = oauth2.NewOAuthTokenRefreshWorker(config.OAuthProvider, logger)
+	if config.OAuthTokenRefreshWorker != nil {
+		config.OAuthTokenRefreshWorker.Start(ctx)
 	}
 
 	// Start per-user OAuth sweep worker: expires stale pending flows and reaps
@@ -5231,15 +5231,15 @@ func (c *Config) GetKVStore() *kvstore.Store {
 }
 
 // Close gracefully shuts down all background components associated with the Config.
-// This includes ModelCatalog sync worker, TokenRefreshWorker, KVStore cleanup loop,
+// This includes ModelCatalog sync worker, OAuthTokenRefreshWorker, KVStore cleanup loop,
 // ConfigStore, LogsStore, and VectorStore. It should be called when the Config is
 // no longer needed to prevent goroutine leaks.
 func (c *Config) Close(ctx context.Context) {
 	if c.ModelCatalog != nil {
 		c.ModelCatalog.Cleanup()
 	}
-	if c.TokenRefreshWorker != nil {
-		c.TokenRefreshWorker.Stop()
+	if c.OAuthTokenRefreshWorker != nil {
+		c.OAuthTokenRefreshWorker.Stop()
 	}
 	if c.OAuthSweepWorker != nil {
 		c.OAuthSweepWorker.Stop()
