@@ -90,6 +90,7 @@ type GovernancePlugin struct {
 	disableAutoToolInject *bool
 
 	complexityAnalyzer atomic.Pointer[complexity.ComplexityAnalyzer]
+	semanticClassifier *complexity.SemanticClassifier
 
 	// embeddingRequestExecutor is wired by the HTTP server after the bifrost
 	// client exists (post-Init) via SetEmbeddingRequestExecutor; nil until
@@ -243,6 +244,7 @@ func Init(
 		isEnterprise:          config != nil && config.IsEnterprise,
 		disableAutoToolInject: disableAutoToolInject,
 		inMemoryStore:         inMemoryStore,
+		semanticClassifier:    complexity.NewSemanticClassifier(ctx, logger),
 	}
 	plugin.storeComplexityAnalyzerConfig(resolveAnalyzerConfigFromStoreOrArg(ctx, logger, configStore, governanceConfig))
 	return plugin, nil
@@ -338,6 +340,7 @@ func InitFromStore(
 		requiredHeaders:       requiredHeaders,
 		isEnterprise:          config != nil && config.IsEnterprise,
 		disableAutoToolInject: disableAutoToolInject,
+		semanticClassifier:    complexity.NewSemanticClassifier(ctx, logger),
 	}
 	plugin.storeComplexityAnalyzerConfig(resolveAnalyzerConfigFromStoreOrArg(ctx, logger, configStore, nil))
 	return plugin, nil
@@ -353,6 +356,23 @@ func (p *GovernancePlugin) ReloadComplexityAnalyzerConfig(config *complexity.Ana
 	p.storeComplexityAnalyzerConfig(config)
 }
 
+// ValidateComplexityAnalyzerConfig checks runtime-only semantic dependencies
+// before a handler persists a complexity configuration.
+func (p *GovernancePlugin) ValidateComplexityAnalyzerConfig(config *complexity.AnalyzerConfig) error {
+	if p.semanticClassifier == nil {
+		return nil
+	}
+	return p.semanticClassifier.ValidateConfig(config)
+}
+
+// ComplexitySemanticStatus returns the current semantic classifier readiness.
+func (p *GovernancePlugin) ComplexitySemanticStatus() complexity.SemanticStatusInfo {
+	if p.semanticClassifier == nil {
+		return complexity.SemanticStatusInfo{State: complexity.SemanticStatusDisabled}
+	}
+	return p.semanticClassifier.Status()
+}
+
 func (p *GovernancePlugin) storeComplexityAnalyzerConfig(config *complexity.AnalyzerConfig) {
 	resolved, err := complexity.ValidateAndNormalize(config)
 	if err != nil {
@@ -363,6 +383,9 @@ func (p *GovernancePlugin) storeComplexityAnalyzerConfig(config *complexity.Anal
 		resolved = &defaults
 	}
 	p.complexityAnalyzer.Store(complexity.NewComplexityAnalyzerWithConfig(resolved))
+	if p.semanticClassifier != nil {
+		p.semanticClassifier.Configure(resolved)
+	}
 }
 
 func resolveAnalyzerConfigFromStoreOrArg(
@@ -706,6 +729,34 @@ func (p *GovernancePlugin) applyRoutingRules(ctx *schemas.BifrostContext, req *s
 				ctx.SetValue(schemas.BifrostContextKeyGovernanceComplexityMechanism, complexity.MechanismSkipped)
 				ctx.AppendRoutingEngineLog(schemas.RoutingEngineRoutingRule, schemas.LogLevelInfo, "Complexity analysis skipped: no supported text-bearing input detected")
 				return nil
+			}
+
+			if p.semanticClassifier != nil && p.semanticClassifier.IsConfigured() {
+				// TODO: Benchmark whether conditionally including one to three prior user
+				// turns improves tier accuracy. Semantic routing intentionally embeds only
+				// the latest user message until that comparison is evidence-backed.
+				semanticResult, err := p.semanticClassifier.Classify(ctx, input.LastUserText)
+				if err != nil {
+					if p.logger != nil {
+						p.logger.Debug("[Governance] Semantic complexity classification unavailable: %v", err)
+					}
+				} else if semanticResult != nil {
+					result := &complexity.ComplexityResult{Tier: semanticResult.Tier, Score: semanticResult.Score}
+					ctx.SetValue(schemas.BifrostContextKeyGovernanceComplexityTier, result.Tier)
+					ctx.SetValue(schemas.BifrostContextKeyGovernanceComplexityScore, result.Score)
+					ctx.SetValue(schemas.BifrostContextKeyGovernanceComplexityMechanism, complexity.MechanismSemantic)
+					ctx.AppendRoutingEngineLog(
+						schemas.RoutingEngineRoutingRule,
+						schemas.LogLevelInfo,
+						fmt.Sprintf("Semantic complexity: tier=%s similarity=%.2f", result.Tier, result.Score),
+					)
+					return result
+				}
+				if p.semanticClassifier.Fallback() == configstore.ComplexitySemanticFallbackNone {
+					ctx.SetValue(schemas.BifrostContextKeyGovernanceComplexityMechanism, complexity.MechanismSkipped)
+					ctx.AppendRoutingEngineLog(schemas.RoutingEngineRoutingRule, schemas.LogLevelInfo, "Semantic complexity analysis unavailable and fallback is disabled")
+					return nil
+				}
 			}
 
 			result := analyzer.Analyze(input)
@@ -1647,9 +1698,16 @@ func (p *GovernancePlugin) Cleanup() error {
 		if p.cancelFunc != nil {
 			p.cancelFunc()
 		}
+		if p.semanticClassifier != nil {
+			if err := p.semanticClassifier.Close(); err != nil {
+				cleanupErr = err
+			}
+		}
 		p.wg.Wait() // Wait for all background workers to complete
 		if err := p.tracker.Cleanup(); err != nil {
-			cleanupErr = err
+			if cleanupErr == nil {
+				cleanupErr = err
+			}
 		}
 	})
 	return cleanupErr
