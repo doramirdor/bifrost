@@ -229,6 +229,8 @@ export default function MCPClientsTable({
 			case "oauth":
 			case "per_user_oauth":
 				return "OAuth";
+			case "token_exchange":
+				return "Token Exchange";
 			default:
 				return type;
 		}
@@ -238,6 +240,7 @@ export default function MCPClientsTable({
 		switch (type) {
 			case "per_user_oauth":
 			case "per_user_headers":
+			case "token_exchange":
 				return "Per-User";
 			case "oauth":
 			case "headers":
@@ -423,7 +426,10 @@ export default function MCPClientsTable({
 									// Per-user auth types (OAuth + headers) don't hold a shared
 									// upstream connection, so reconnect is a no-op for them — the
 									// backend's ReconnectClient rejects with ErrMCPReconnectNotApplicable.
-									const isPerUserAuth = c.config.auth_type === "per_user_oauth" || c.config.auth_type === "per_user_headers";
+									const isPerUserAuth =
+									c.config.auth_type === "per_user_oauth" ||
+									c.config.auth_type === "per_user_headers" ||
+									c.config.auth_type === "token_exchange";
 									const enabledToolsCount =
 										c.state == "connected"
 											? c.config.tools_to_execute?.includes("*")
