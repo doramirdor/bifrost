@@ -190,14 +190,24 @@ func (m *authRetryClientManager) AcquireClientConn(_ *schemas.BifrostContext, _ 
 	return m.acquireConn, func() {}, nil
 }
 
+// ReconnectClient mirrors the real MCPManager.beginExclusiveClientOp
+// contract: a completed op is left in m.inflight rather than cleared, so a
+// caller that lost the race and calls AwaitReconnect afterward still finds
+// the (by-then-finished) op instead of racing a delete. A new call only
+// starts a fresh op when none is present or the previous one has finished.
 func (m *authRetryClientManager) ReconnectClient(_ string) error {
+	op := &inflightClientOp{done: make(chan struct{})}
 	m.inflightMu.Lock()
 	if m.inflight != nil {
-		m.inflightMu.Unlock()
-		m.reconnectRejected.Add(1)
-		return errors.New("reconnect already in progress for this client")
+		select {
+		case <-m.inflight.done:
+			// Previous op finished; replace it and proceed as the new winner.
+		default:
+			m.inflightMu.Unlock()
+			m.reconnectRejected.Add(1)
+			return errors.New("reconnect already in progress for this client")
+		}
 	}
-	op := &inflightClientOp{done: make(chan struct{})}
 	m.inflight = op
 	m.inflightMu.Unlock()
 
@@ -213,11 +223,8 @@ func (m *authRetryClientManager) ReconnectClient(_ string) error {
 	}
 	err := m.reconnectErr
 
-	m.inflightMu.Lock()
 	op.err = err
 	close(op.done)
-	m.inflight = nil
-	m.inflightMu.Unlock()
 	return err
 }
 
