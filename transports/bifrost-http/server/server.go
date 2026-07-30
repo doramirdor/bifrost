@@ -143,6 +143,15 @@ type ServerCallbacks interface {
 	// mutation that invalidates its token rows as a set (credential
 	// rotation, access reconciliation, client deletion).
 	EvictOauthTokenCacheByMCPClient(ctx context.Context, mcpClientID string)
+	// EvictMCPHeaderCredentialCacheByID drops the cached per-user MCP header
+	// credential backed by the given credential row ID after a database
+	// write that bypassed the headers provider's own write paths.
+	EvictMCPHeaderCredentialCacheByID(ctx context.Context, credentialID string)
+	// EvictMCPHeaderCredentialCacheByMCPClient drops every cached per-user
+	// MCP header credential bound to the given MCP client after a
+	// client-level mutation that invalidates its credential rows as a set
+	// (needs_update schema flip, access reconciliation, client deletion).
+	EvictMCPHeaderCredentialCacheByMCPClient(ctx context.Context, mcpClientID string)
 }
 
 // LogRedactionMappingResolverProvider is implemented by servers that can attach reveal data to log-detail responses.
@@ -321,6 +330,7 @@ func (s *BifrostHTTPServer) RemoveMCPClient(ctx context.Context, id string) erro
 		logger.Warn("failed to sync MCP servers after removing client: %v", err)
 	}
 	s.Config.OAuthProvider.EvictUserTokensByMCPClient(id)
+	s.Config.MCPHeadersProvider.EvictCredentialsByMCPClient(id)
 	return nil
 }
 
@@ -479,6 +489,7 @@ func (s *BifrostHTTPServer) ReloadVirtualKey(ctx context.Context, id string) (*t
 	}
 	s.MCPServerHandler.SyncVKMCPServer(virtualKey)
 	s.Config.OAuthProvider.EvictUserTokensByVirtualKey(id)
+	s.Config.MCPHeadersProvider.EvictCredentialsByVirtualKey(id)
 	return virtualKey, nil
 }
 
@@ -502,6 +513,7 @@ func (s *BifrostHTTPServer) RemoveVirtualKey(ctx context.Context, id string) err
 	governancePlugin.GetGovernanceStore().DeleteVirtualKeyInMemory(ctx, id)
 	s.MCPServerHandler.DeleteVKMCPServer(preloadedVk.Value.GetValue())
 	s.Config.OAuthProvider.EvictUserTokensByVirtualKey(id)
+	s.Config.MCPHeadersProvider.EvictCredentialsByVirtualKey(id)
 	return nil
 }
 
@@ -983,6 +995,48 @@ func (s *BifrostHTTPServer) FlushOauthTokenCache(ctx context.Context) {
 		return
 	}
 	s.Config.OAuthProvider.FlushUserTokenCache()
+}
+
+// EvictMCPHeaderCredentialCacheByID drops the cached per-user MCP header
+// credential backed by the given credential row ID from the in-memory cache
+// after a database write. A clustered deployment overrides this to also
+// notify peers.
+func (s *BifrostHTTPServer) EvictMCPHeaderCredentialCacheByID(ctx context.Context, credentialID string) {
+	if s.Config == nil || s.Config.MCPHeadersProvider == nil {
+		return
+	}
+	s.Config.MCPHeadersProvider.EvictCredentialByID(credentialID)
+}
+
+// EvictMCPHeaderCredentialCacheByMCPClient drops every cached per-user MCP
+// header credential bound to the given MCP client from the in-memory cache.
+// A clustered deployment overrides this to also notify peers.
+func (s *BifrostHTTPServer) EvictMCPHeaderCredentialCacheByMCPClient(ctx context.Context, mcpClientID string) {
+	if s.Config == nil || s.Config.MCPHeadersProvider == nil {
+		return
+	}
+	s.Config.MCPHeadersProvider.EvictCredentialsByMCPClient(mcpClientID)
+}
+
+// EvictMCPHeaderCredentialCacheByVirtualKey drops every cached vk-mode MCP
+// header credential bound to the given virtual key from the in-memory cache.
+// A clustered deployment overrides this to also notify peers.
+func (s *BifrostHTTPServer) EvictMCPHeaderCredentialCacheByVirtualKey(ctx context.Context, virtualKeyID string) {
+	if s.Config == nil || s.Config.MCPHeadersProvider == nil {
+		return
+	}
+	s.Config.MCPHeadersProvider.EvictCredentialsByVirtualKey(virtualKeyID)
+}
+
+// FlushMCPHeaderCredentialCache drops every cached per-user MCP header
+// credential from the in-memory cache. The coarse fallback for mutations
+// whose blast radius cannot be scoped to one client or virtual key. A
+// clustered deployment overrides this to also notify peers.
+func (s *BifrostHTTPServer) FlushMCPHeaderCredentialCache(ctx context.Context) {
+	if s.Config == nil || s.Config.MCPHeadersProvider == nil {
+		return
+	}
+	s.Config.MCPHeadersProvider.FlushCredentialCache()
 }
 
 // ReloadClientConfigFromConfigStore reloads the client config from config store
