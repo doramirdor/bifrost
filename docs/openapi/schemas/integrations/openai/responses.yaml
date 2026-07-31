@@ -11,9 +11,15 @@ OpenAIResponsesRequest:
       description: Model identifier
       example: gpt-4
     input:
-      $ref: '#/OpenAIResponsesInput'
+      $ref: "#/OpenAIResponsesInput"
     stream:
       type: boolean
+    context_management:
+      type: array
+      description: Automatic context window management.
+      items:
+        type: object
+        additionalProperties: true
     instructions:
       type: string
       description: System instructions for the model
@@ -27,7 +33,7 @@ OpenAIResponsesRequest:
     previous_response_id:
       type: string
     reasoning:
-      $ref: '#/OpenAIResponsesReasoning'
+      $ref: "#/OpenAIResponsesReasoning"
     store:
       type: boolean
     temperature:
@@ -35,13 +41,13 @@ OpenAIResponsesRequest:
       minimum: 0
       maximum: 2
     text:
-      $ref: '#/OpenAIResponsesTextConfig'
+      $ref: "#/OpenAIResponsesTextConfig"
     tool_choice:
-      $ref: '../../inference/responses.yaml#/ResponsesToolChoice'
+      $ref: "../../inference/responses.yaml#/ResponsesToolChoice"
     tools:
       type: array
       items:
-        $ref: '../../inference/responses.yaml#/ResponsesTool'
+        $ref: "../../inference/responses.yaml#/ResponsesTool"
     top_p:
       type: number
     truncation:
@@ -60,7 +66,7 @@ OpenAIResponsesInput:
     - type: string
     - type: array
       items:
-        $ref: '../../inference/responses.yaml#/ResponsesMessage'
+        $ref: "../../inference/responses.yaml#/ResponsesMessage"
   description: Input - can be a string or array of messages
 
 OpenAIResponsesReasoning:
@@ -82,7 +88,7 @@ OpenAIResponsesTextConfig:
   type: object
   properties:
     format:
-      $ref: '#/OpenAIResponsesTextFormat'
+      $ref: "#/OpenAIResponsesTextFormat"
 
 OpenAIResponsesTextFormat:
   type: object
@@ -102,7 +108,7 @@ OpenAIResponsesTextFormat:
 
 # Response reuses inference schema
 OpenAIResponsesResponse:
-  $ref: '../../inference/responses.yaml#/ResponsesResponse'
+  $ref: "../../inference/responses.yaml#/ResponsesResponse"
 
 OpenAIResponsesStreamResponse:
-  $ref: '../../inference/responses.yaml#/ResponsesStreamResponse'
+  $ref: "../../inference/responses.yaml#/ResponsesStreamResponse"

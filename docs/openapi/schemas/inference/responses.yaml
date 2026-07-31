@@ -10,7 +10,7 @@ ResponsesRequest:
       type: string
       description: Model in provider/model format
     input:
-      $ref: '#/ResponsesRequestInput'
+      $ref: "#/ResponsesRequestInput"
     fallbacks:
       type: array
       items:
@@ -21,6 +21,12 @@ ResponsesRequest:
       type: boolean
     conversation:
       type: string
+    context_management:
+      type: array
+      description: Automatic context window management.
+      items:
+        type: object
+        additionalProperties: true
     include:
       type: array
       items:
@@ -41,29 +47,29 @@ ResponsesRequest:
     prompt_cache_key:
       type: string
     reasoning:
-      $ref: '#/ResponsesParametersReasoning'
+      $ref: "#/ResponsesParametersReasoning"
     safety_identifier:
       type: string
     service_tier:
       type: string
     stream_options:
-      $ref: '#/ResponsesStreamOptions'
+      $ref: "#/ResponsesStreamOptions"
     store:
       type: boolean
     temperature:
       type: number
     text:
-      $ref: '#/ResponsesTextConfig'
+      $ref: "#/ResponsesTextConfig"
     top_logprobs:
       type: integer
     top_p:
       type: number
     tool_choice:
-      $ref: '#/ResponsesToolChoice'
+      $ref: "#/ResponsesToolChoice"
     tools:
       type: array
       items:
-        $ref: '#/ResponsesTool'
+        $ref: "#/ResponsesTool"
     truncation:
       type: string
 
@@ -72,7 +78,7 @@ ResponsesRequestInput:
     - type: string
     - type: array
       items:
-        $ref: '#/ResponsesMessage'
+        $ref: "#/ResponsesMessage"
   description: Input - can be a string or array of messages
 
 ResponsesMessage:
@@ -81,7 +87,7 @@ ResponsesMessage:
     id:
       type: string
     type:
-      $ref: '#/ResponsesMessageType'
+      $ref: "#/ResponsesMessageType"
     status:
       type: string
       enum: [in_progress, completed, incomplete, interpreting, failed]
@@ -89,7 +95,7 @@ ResponsesMessage:
       type: string
       enum: [assistant, user, system, developer]
     content:
-      $ref: '#/ResponsesMessageContent'
+      $ref: "#/ResponsesMessageContent"
     call_id:
       type: string
     name:
@@ -105,7 +111,7 @@ ResponsesMessage:
         - type: string
         - type: array
           items:
-            $ref: '#/ResponsesMessageContentBlock'
+            $ref: "#/ResponsesMessageContentBlock"
         - type: object
           description: Computer tool call output (computer_screenshot).
           properties:
@@ -131,7 +137,7 @@ ResponsesMessage:
     summary:
       type: array
       items:
-        $ref: '#/ResponsesReasoningSummary'
+        $ref: "#/ResponsesReasoningSummary"
     encrypted_content:
       type: string
 
@@ -165,7 +171,7 @@ ResponsesMessageContent:
     - type: string
     - type: array
       items:
-        $ref: '#/ResponsesMessageContentBlock'
+        $ref: "#/ResponsesMessageContentBlock"
 
 ResponsesMessageContentBlock:
   type: object
@@ -174,7 +180,16 @@ ResponsesMessageContentBlock:
   properties:
     type:
       type: string
-      enum: [input_text, input_image, input_file, input_audio, output_text, refusal, reasoning_text]
+      enum:
+        [
+          input_text,
+          input_image,
+          input_file,
+          input_audio,
+          output_text,
+          refusal,
+          reasoning_text,
+        ]
     file_id:
       type: string
     text:
@@ -194,19 +209,19 @@ ResponsesMessageContentBlock:
     file_type:
       type: string
     input_audio:
-      $ref: '#/ResponsesInputMessageContentBlockAudio'
+      $ref: "#/ResponsesInputMessageContentBlockAudio"
     annotations:
       type: array
       items:
-        $ref: '#/ResponsesOutputMessageContentTextAnnotation'
+        $ref: "#/ResponsesOutputMessageContentTextAnnotation"
     logprobs:
       type: array
       items:
-        $ref: '#/ResponsesOutputMessageContentTextLogProb'
+        $ref: "#/ResponsesOutputMessageContentTextLogProb"
     refusal:
       type: string
     cache_control:
-      $ref: './common.yaml#/CacheControl'
+      $ref: "./common.yaml#/CacheControl"
 
 ResponsesInputMessageContentBlockAudio:
   type: object
@@ -259,7 +274,7 @@ ResponsesOutputMessageContentTextLogProb:
     top_logprobs:
       type: array
       items:
-        $ref: './chat.yaml#/LogProb'
+        $ref: "./chat.yaml#/LogProb"
 
 ResponsesParametersReasoning:
   type: object
@@ -286,7 +301,7 @@ ResponsesTextConfig:
   type: object
   properties:
     format:
-      $ref: '#/ResponsesTextConfigFormat'
+      $ref: "#/ResponsesTextConfigFormat"
     verbosity:
       type: string
       enum: [low, medium, high]
@@ -310,7 +325,7 @@ ResponsesToolChoice:
   oneOf:
     - type: string
       enum: [none, auto, required]
-    - $ref: '#/ResponsesToolChoiceStruct'
+    - $ref: "#/ResponsesToolChoiceStruct"
 
 ResponsesToolChoiceStruct:
   type: object
@@ -342,7 +357,7 @@ ResponsesToolChoiceStruct:
     tools:
       type: array
       items:
-        $ref: '#/ResponsesToolChoiceAllowedToolDef'
+        $ref: "#/ResponsesToolChoiceAllowedToolDef"
 
 ResponsesToolChoiceAllowedToolDef:
   type: object
@@ -383,9 +398,9 @@ ResponsesTool:
     description:
       type: string
     cache_control:
-      $ref: './common.yaml#/CacheControl'
+      $ref: "./common.yaml#/CacheControl"
     parameters:
-      $ref: './chat.yaml#/ToolFunctionParameters'
+      $ref: "./chat.yaml#/ToolFunctionParameters"
     strict:
       type: boolean
     vector_store_ids:
@@ -472,16 +487,21 @@ ResponsesResponse:
       type: boolean
     conversation:
       type: object
+    context_management:
+      type: array
+      items:
+        type: object
+        additionalProperties: true
     created_at:
       type: integer
     error:
-      $ref: '#/ResponsesResponseError'
+      $ref: "#/ResponsesResponseError"
     include:
       type: array
       items:
         type: string
     incomplete_details:
-      $ref: '#/ResponsesResponseIncompleteDetails'
+      $ref: "#/ResponsesResponseIncompleteDetails"
     instructions:
       type: object
     max_output_tokens:
@@ -495,7 +515,7 @@ ResponsesResponse:
     output:
       type: array
       items:
-        $ref: '#/ResponsesMessage'
+        $ref: "#/ResponsesMessage"
     parallel_tool_calls:
       type: boolean
     previous_response_id:
@@ -505,7 +525,7 @@ ResponsesResponse:
     prompt_cache_key:
       type: string
     reasoning:
-      $ref: '#/ResponsesParametersReasoning'
+      $ref: "#/ResponsesParametersReasoning"
     safety_identifier:
       type: string
     service_tier:
@@ -520,31 +540,31 @@ ResponsesResponse:
     temperature:
       type: number
     text:
-      $ref: '#/ResponsesTextConfig'
+      $ref: "#/ResponsesTextConfig"
     top_logprobs:
       type: integer
     top_p:
       type: number
     tool_choice:
-      $ref: '#/ResponsesToolChoice'
+      $ref: "#/ResponsesToolChoice"
     tools:
       type: array
       items:
-        $ref: '#/ResponsesTool'
+        $ref: "#/ResponsesTool"
     truncation:
       type: string
     usage:
-      $ref: '#/ResponsesResponseUsage'
+      $ref: "#/ResponsesResponseUsage"
     extra_fields:
-      $ref: './common.yaml#/BifrostResponseExtraFields'
+      $ref: "./common.yaml#/BifrostResponseExtraFields"
     search_results:
       type: array
       items:
-        $ref: './chat.yaml#/PerplexitySearchResult'
+        $ref: "./chat.yaml#/PerplexitySearchResult"
     videos:
       type: array
       items:
-        $ref: './chat.yaml#/VideoResult'
+        $ref: "./chat.yaml#/VideoResult"
     citations:
       type: array
       items:
@@ -575,15 +595,15 @@ ResponsesResponseUsage:
     input_tokens:
       type: integer
     input_tokens_details:
-      $ref: '#/ResponsesResponseInputTokens'
+      $ref: "#/ResponsesResponseInputTokens"
     output_tokens:
       type: integer
     output_tokens_details:
-      $ref: '#/ResponsesResponseOutputTokens'
+      $ref: "#/ResponsesResponseOutputTokens"
     total_tokens:
       type: integer
     cost:
-      $ref: './usage.yaml#/BifrostCost'
+      $ref: "./usage.yaml#/BifrostCost"
 
 ResponsesResponseInputTokens:
   type: object
@@ -630,21 +650,21 @@ ResponsesStreamResponse:
   description: Streaming responses API response (SSE format)
   properties:
     type:
-      $ref: '#/ResponsesStreamResponseType'
+      $ref: "#/ResponsesStreamResponseType"
     sequence_number:
       type: integer
     response:
-      $ref: '#/ResponsesResponse'
+      $ref: "#/ResponsesResponse"
     output_index:
       type: integer
     item:
-      $ref: '#/ResponsesMessage'
+      $ref: "#/ResponsesMessage"
     content_index:
       type: integer
     item_id:
       type: string
     part:
-      $ref: '#/ResponsesMessageContentBlock'
+      $ref: "#/ResponsesMessageContentBlock"
     delta:
       type: string
     signature:
@@ -652,7 +672,7 @@ ResponsesStreamResponse:
     logprobs:
       type: array
       items:
-        $ref: '#/ResponsesOutputMessageContentTextLogProb'
+        $ref: "#/ResponsesOutputMessageContentTextLogProb"
     text:
       type: string
     refusal:
@@ -664,7 +684,7 @@ ResponsesStreamResponse:
     partial_image_index:
       type: integer
     annotation:
-      $ref: '#/ResponsesOutputMessageContentTextAnnotation'
+      $ref: "#/ResponsesOutputMessageContentTextAnnotation"
     annotation_index:
       type: integer
     code:
@@ -674,7 +694,7 @@ ResponsesStreamResponse:
     param:
       type: string
     extra_fields:
-      $ref: './common.yaml#/BifrostResponseExtraFields'
+      $ref: "./common.yaml#/BifrostResponseExtraFields"
 
 ResponsesStreamResponseType:
   type: string
@@ -746,7 +766,7 @@ BifrostResponsesDeleteResponse:
     deleted:
       type: boolean
     extra_fields:
-      $ref: './common.yaml#/BifrostResponseExtraFields'
+      $ref: "./common.yaml#/BifrostResponseExtraFields"
 
 BifrostResponsesInputItemsResponse:
   type: object
@@ -757,7 +777,7 @@ BifrostResponsesInputItemsResponse:
     data:
       type: array
       items:
-        $ref: '#/ResponsesMessage'
+        $ref: "#/ResponsesMessage"
     has_more:
       type: boolean
     first_id:
@@ -765,4 +785,4 @@ BifrostResponsesInputItemsResponse:
     last_id:
       type: string
     extra_fields:
-      $ref: './common.yaml#/BifrostResponseExtraFields'
+      $ref: "./common.yaml#/BifrostResponseExtraFields"

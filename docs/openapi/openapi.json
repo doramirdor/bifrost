@@ -69390,6 +69390,14 @@
           "conversation": {
             "type": "string"
           },
+          "context_management": {
+            "type": "array",
+            "description": "Automatic context window management.",
+            "items": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          },
           "include": {
             "type": "array",
             "items": {
@@ -69765,6 +69773,13 @@
           },
           "conversation": {
             "type": "object"
+          },
+          "context_management": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": true
+            }
           },
           "created_at": {
             "type": "integer"
@@ -74506,6 +74521,14 @@
           },
           "stream": {
             "type": "boolean"
+          },
+          "context_management": {
+            "type": "array",
+            "description": "Automatic context window management, e.g. compaction (https://developers.openai.com/api/docs/guides/compaction)",
+            "items": {
+              "type": "object",
+              "additionalProperties": true
+            }
           },
           "instructions": {
             "type": "string",
