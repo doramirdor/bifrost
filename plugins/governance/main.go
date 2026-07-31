@@ -746,6 +746,29 @@ func (p *GovernancePlugin) applyRoutingRules(ctx *schemas.BifrostContext, req *s
 					if p.logger != nil {
 						p.logger.Debug("[Governance] Semantic complexity classification unavailable: %v", err)
 					}
+					// Degrading to lexical is otherwise indistinguishable from
+					// never having enabled semantic routing: the request log
+					// records mechanism=lexical either way.
+					ctx.AppendRoutingEngineLog(schemas.RoutingEngineRoutingRule, schemas.LogLevelWarn, "Semantic complexity classification unavailable; resolving through fallback")
+				} else if semanticResult != nil && !semanticResult.Accepted {
+					if p.logger != nil {
+						p.logger.Debug(
+							"[Governance] Semantic complexity below min_similarity: tier=%s similarity=%.2f min=%.2f",
+							semanticResult.Tier,
+							semanticResult.Score,
+							semanticResult.MinSimilarity,
+						)
+					}
+					ctx.AppendRoutingEngineLog(
+						schemas.RoutingEngineRoutingRule,
+						schemas.LogLevelInfo,
+						fmt.Sprintf(
+							"Semantic complexity rejected: nearest tier=%s similarity=%.2f below min_similarity=%.2f",
+							semanticResult.Tier,
+							semanticResult.Score,
+							semanticResult.MinSimilarity,
+						),
+					)
 				} else if semanticResult != nil {
 					result := &complexity.ComplexityResult{Tier: semanticResult.Tier, Score: semanticResult.Score}
 					ctx.SetValue(schemas.BifrostContextKeyGovernanceComplexityTier, result.Tier)

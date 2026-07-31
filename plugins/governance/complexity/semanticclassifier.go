@@ -66,6 +66,13 @@ type SemanticStatusInfo struct {
 type SemanticResult struct {
 	Tier  string
 	Score float64
+	// MinSimilarity is the configured floor Score was tested against, echoed so
+	// callers can log a near miss without re-reading classifier state.
+	MinSimilarity float64
+	// Accepted reports whether Score cleared MinSimilarity. A rejected result
+	// still carries its tier and score for logging, but callers must not route
+	// on it — they resolve it through the configured fallback instead.
+	Accepted bool
 }
 
 // EmbeddingFunc creates one embedding for semantic complexity classification.
@@ -235,9 +242,19 @@ func (c *SemanticClassifier) Classify(ctx context.Context, text string) (*Semant
 		return nil, fmt.Errorf("embedding dimension %d does not match configured dimension %d", len(embedding), semantic.Dimension)
 	}
 
+	// MinSimilarity is deliberately not pushed into the query. Backends that
+	// filter server-side (Weaviate's certainty, Qdrant's score threshold) would
+	// drop the rejected candidate instead of returning it, and its score is
+	// exactly what makes a near miss diagnosable in the request log. Asking for
+	// a single result means the backend does the same work either way.
+	//
+	// The floor passed down is 0 rather than "no floor": a nearest exemplar with
+	// negative similarity points away from every tier, so it is never a
+	// defensible classification, and 0 is valid on every backend (Weaviate
+	// rejects a negative certainty).
 	results, err := store.GetNearest(ctx, namespace, embedding,
 		[]vectorstore.Query{{Field: semanticMetadataKind, Operator: vectorstore.QueryOperatorEqual, Value: semanticMetadataKindExample}},
-		[]string{semanticMetadataTier}, -1, 1)
+		[]string{semanticMetadataTier}, 0, 1)
 	if err != nil {
 		return nil, fmt.Errorf("query complexity exemplars: %w", err)
 	}
@@ -248,7 +265,13 @@ func (c *SemanticClassifier) Classify(ctx context.Context, text string) (*Semant
 	if !ok || !isComplexityTier(tier) {
 		return nil, fmt.Errorf("nearest complexity exemplar has invalid tier metadata")
 	}
-	return &SemanticResult{Tier: tier, Score: *results[0].Score}, nil
+	score := *results[0].Score
+	return &SemanticResult{
+		Tier:          tier,
+		Score:         score,
+		MinSimilarity: semantic.MinSimilarity,
+		Accepted:      semantic.MinSimilarity <= 0 || score >= semantic.MinSimilarity,
+	}, nil
 }
 
 // Close cancels active warmup and waits for the classifier's single worker to
