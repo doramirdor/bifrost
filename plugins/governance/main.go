@@ -738,10 +738,10 @@ func (p *GovernancePlugin) applyRoutingRules(ctx *schemas.BifrostContext, req *s
 			}
 
 			if p.semanticClassifier != nil && p.semanticClassifier.IsConfigured() {
-				// TODO: Benchmark whether conditionally including one to three prior user
-				// turns improves tier accuracy. Semantic routing intentionally embeds only
-				// the latest user message until that comparison is evidence-backed.
-				semanticResult, err := p.semanticClassifier.Classify(ctx, input.LastUserText)
+				// How much of the conversation is embedded is configuration
+				// (semantic.message_history_count); the classifier applies it from
+				// the same snapshot that owns the exemplars.
+				semanticResult, err := p.semanticClassifier.Classify(ctx, input)
 				if err != nil {
 					if p.logger != nil {
 						p.logger.Debug("[Governance] Semantic complexity classification unavailable: %v", err)
